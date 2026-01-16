@@ -83,6 +83,18 @@ pub fn calculate_layout(
         cell_assignments[*original_idx] = grid_pos;
     }
 
+    // Calculate actual grid dimensions used
+    let windows_in_last_row = count % cols;
+    let last_row_cols = if windows_in_last_row == 0 { cols } else { windows_in_last_row };
+
+    // Grid dimensions (full grid)
+    let grid_width = (cols as u16 * cell_width) + ((cols as u16).saturating_sub(1) * config.padding);
+    let grid_height = (rows as u16 * cell_height) + ((rows as u16).saturating_sub(1) * config.padding);
+
+    // Center the grid on screen
+    let grid_offset_x = (screen_width.saturating_sub(grid_width)) / 2;
+    let grid_offset_y = (screen_height.saturating_sub(grid_height)) / 2;
+
     // Build layouts based on assignments
     let mut layouts = Vec::with_capacity(count);
 
@@ -91,11 +103,20 @@ pub fn calculate_layout(
         let col = cell_idx % cols;
         let row = cell_idx / cols;
 
-        // Calculate cell position
-        let cell_x =
-            config.margin as i16 + (col as u16 * (cell_width + config.padding)) as i16;
-        let cell_y =
-            config.margin as i16 + (row as u16 * (cell_height + config.padding)) as i16;
+        // For the last row, center it if it has fewer items
+        let row_offset_x = if row == rows - 1 && last_row_cols < cols {
+            let last_row_width = (last_row_cols as u16 * cell_width) +
+                ((last_row_cols as u16).saturating_sub(1) * config.padding);
+            (grid_width.saturating_sub(last_row_width)) / 2
+        } else {
+            0
+        };
+
+        // Calculate cell position (centered grid + row centering for last row)
+        let cell_x = grid_offset_x as i16 + row_offset_x as i16 +
+            (col as u16 * (cell_width + config.padding)) as i16;
+        let cell_y = grid_offset_y as i16 +
+            (row as u16 * (cell_height + config.padding)) as i16;
 
         // Scale window to fit in cell while preserving aspect ratio
         let (thumb_width, thumb_height) = scale_to_fit(
