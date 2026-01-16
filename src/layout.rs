@@ -26,6 +26,8 @@ impl Default for LayoutConfig {
 }
 
 /// Calculate thumbnail layouts for all windows in a grid.
+/// Windows are assigned to grid positions based on their screen location
+/// to preserve spatial relationships (Apple-style layout).
 pub fn calculate_layout(
     windows: &[WindowInfo],
     screen_width: u16,
@@ -50,11 +52,44 @@ pub fn calculate_layout(
     let cell_width = available_width.saturating_sub(total_h_padding) / cols as u16;
     let cell_height = available_height.saturating_sub(total_v_padding) / rows as u16;
 
+    // Create window list with positions for sorting
+    let mut indexed_windows: Vec<(usize, &WindowInfo)> = windows.iter().enumerate().collect();
+
+    // Sort windows spatially: top-to-bottom, then left-to-right
+    // This determines which windows get which grid positions
+    indexed_windows.sort_by(|a, b| {
+        let center_y_a = a.1.y as f64 + a.1.height as f64 / 2.0;
+        let center_y_b = b.1.y as f64 + b.1.height as f64 / 2.0;
+        let center_x_a = a.1.x as f64 + a.1.width as f64 / 2.0;
+        let center_x_b = b.1.x as f64 + b.1.width as f64 / 2.0;
+
+        // Determine which row each window belongs to based on screen position
+        let row_height = screen_height as f64 / rows as f64;
+        let row_a = (center_y_a / row_height) as usize;
+        let row_b = (center_y_b / row_height) as usize;
+
+        if row_a != row_b {
+            row_a.cmp(&row_b)
+        } else {
+            // Same row, sort by X position
+            center_x_a.partial_cmp(&center_x_b).unwrap_or(std::cmp::Ordering::Equal)
+        }
+    });
+
+    // Assign grid positions based on sorted order
+    // Window at sorted position N gets grid cell N
+    let mut cell_assignments: Vec<usize> = vec![0; count];
+    for (grid_pos, (original_idx, _)) in indexed_windows.iter().enumerate() {
+        cell_assignments[*original_idx] = grid_pos;
+    }
+
+    // Build layouts based on assignments
     let mut layouts = Vec::with_capacity(count);
 
     for (i, window) in windows.iter().enumerate() {
-        let col = i % cols;
-        let row = i / cols;
+        let cell_idx = cell_assignments[i];
+        let col = cell_idx % cols;
+        let row = cell_idx / cols;
 
         // Calculate cell position
         let cell_x =
