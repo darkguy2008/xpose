@@ -343,7 +343,7 @@ fn run() -> Result<()> {
                 )?;
             }
 
-            // Render non-selected windows first
+            // Render non-selected windows first (no borders during exit)
             for (i, (capture, layout)) in captures.iter().zip(current.iter()).enumerate() {
                 if Some(i) != selected_window {
                     xconn.render_thumbnail_animated(
@@ -353,7 +353,6 @@ fn run() -> Result<()> {
                         capture.info.height,
                         layout,
                     )?;
-                    xconn.draw_thumbnail_border_animated(&overview, layout, false)?;
                 }
             }
 
@@ -367,7 +366,6 @@ fn run() -> Result<()> {
                     captures[idx].info.height,
                     layout,
                 )?;
-                xconn.draw_thumbnail_border_animated(&overview, layout, false)?;
             }
 
             xconn.present_overview(&overview)?;
