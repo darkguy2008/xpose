@@ -378,6 +378,19 @@ fn run() -> Result<()> {
     // Cleanup
     log::debug!("Cleaning up");
 
+    // Raise and focus selected window BEFORE destroying overview to avoid flicker
+    if let Some(index) = selected_window {
+        if index < captures.len() {
+            let window_info = &captures[index].info;
+            log::info!(
+                "Raising window: {:?}",
+                window_info.wm_name.as_deref().unwrap_or("(unnamed)")
+            );
+            xconn.raise_and_focus(window_info)?;
+            xconn.flush()?;
+        }
+    }
+
     xconn.conn.ungrab_keyboard(x11rb::CURRENT_TIME)?;
     xconn.conn.ungrab_pointer(x11rb::CURRENT_TIME)?;
     xconn.destroy_overview(&overview)?;
@@ -391,18 +404,6 @@ fn run() -> Result<()> {
     for capture in &skipped_captures {
         if let Err(e) = xconn.release_capture(capture) {
             log::warn!("Failed to release skipped capture: {}", e);
-        }
-    }
-
-    // Raise and focus selected window
-    if let Some(index) = selected_window {
-        if index < captures.len() {
-            let window_info = &captures[index].info;
-            log::info!(
-                "Raising window: {:?}",
-                window_info.wm_name.as_deref().unwrap_or("(unnamed)")
-            );
-            xconn.raise_and_focus(window_info)?;
         }
     }
 
