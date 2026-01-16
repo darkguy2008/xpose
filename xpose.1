@@ -1,0 +1,54 @@
+.TH XPOSE 1 "January 2026" "xpose 0.1.0" "User Commands"
+.SH NAME
+xpose \- an Expose-like window switcher for X11
+.SH SYNOPSIS
+.B xpose
+.SH DESCRIPTION
+.B xpose
+is a lightweight window switcher that displays all windows as scaled thumbnails
+in a grid layout, similar to macOS Expose. It works with TWM and other minimal
+window managers that don't support EWMH.
+.PP
+Features:
+.IP \(bu 2
+Real-time window thumbnails using XComposite/XRender
+.IP \(bu 2
+Live updates via XDamage extension
+.IP \(bu 2
+Click to select and focus window
+.IP \(bu 2
+Hover highlighting with cyan border
+.IP \(bu 2
+Auto-scaling grid layout
+.SH USAGE
+When invoked,
+.B xpose
+displays all mapped windows as non-overlapping thumbnails. Click on a thumbnail
+to raise and focus that window. Press Escape to dismiss without selecting.
+.SH ENVIRONMENT
+.TP
+.B RUST_LOG
+Set to
+.I debug
+to enable debug logging. For example:
+.B RUST_LOG=debug xpose
+.SH EXAMPLES
+.TP
+Run the window switcher:
+.B xpose
+.TP
+Run with debug logging:
+.B RUST_LOG=debug xpose
+.TP
+Bind to a TWM hotkey (add to .twmrc):
+.nf
+"Tab" = mod4 : all : !"xpose"
+.fi
+.SH AUTHOR
+DARKGuy
+.SH SEE ALSO
+.BR twm (1),
+.BR xprop (1),
+.BR xwininfo (1),
+.BR xdeskie (1),
+.BR xtabbie (1)
