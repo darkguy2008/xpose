@@ -1,3 +1,4 @@
+mod animation;
 mod capture;
 mod connection;
 mod error;
@@ -14,6 +15,9 @@ use x11rb::protocol::damage as xdamage;
 use x11rb::protocol::xproto::*;
 use x11rb::protocol::Event;
 
+use std::thread;
+
+use animation::{calculate_start_layouts, AnimationConfig, Animator};
 use capture::CapturedWindow;
 use connection::XConnection;
 use error::Result;
@@ -106,12 +110,8 @@ fn run() -> Result<()> {
     // Create overview window
     let overview = xconn.create_overview_window()?;
 
-    // Render all thumbnails
-    render_all_thumbnails(&xconn, &captures, &layouts, &overview, None)?;
-
-    // Map window and grab input
+    // Map window and grab input before animation
     xconn.conn.map_window(overview.window)?;
-    xconn.present_overview(&overview)?;
 
     // Grab keyboard
     xconn.conn.grab_keyboard(
@@ -135,6 +135,43 @@ fn run() -> Result<()> {
     )?;
 
     xconn.flush()?;
+
+    // Run entrance animation
+    let windows_info: Vec<_> = captures.iter().map(|c| c.info.clone()).collect();
+    let start_layouts = calculate_start_layouts(
+        &windows_info,
+        &layouts,
+        xconn.screen_width,
+        xconn.screen_height,
+    );
+
+    let anim_config = AnimationConfig::default();
+    let animator = Animator::new(start_layouts, layouts.clone(), &anim_config);
+
+    // Animation loop
+    while !animator.is_complete() {
+        let current = animator.current_layouts();
+
+        xconn.clear_overview(&overview)?;
+
+        for (capture, layout) in captures.iter().zip(current.iter()) {
+            xconn.render_thumbnail_animated(
+                capture.picture,
+                overview.picture,
+                capture.info.width,
+                capture.info.height,
+                layout,
+            )?;
+            xconn.draw_thumbnail_border_animated(&overview, layout, false)?;
+        }
+
+        xconn.present_overview(&overview)?;
+        thread::sleep(animator.frame_duration());
+    }
+
+    // Render final static state
+    render_all_thumbnails(&xconn, &captures, &layouts, &overview, None)?;
+    xconn.present_overview(&overview)?;
 
     log::info!("Overview displayed, waiting for input");
 

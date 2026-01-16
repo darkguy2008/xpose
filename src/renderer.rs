@@ -1,6 +1,7 @@
 use x11rb::connection::Connection;
 use x11rb::protocol::render::{self, Picture, PictOp, Transform};
 use x11rb::protocol::xproto::*;
+use crate::animation::AnimatedLayout;
 use crate::connection::XConnection;
 use crate::error::Result;
 use crate::layout::ThumbnailLayout;
@@ -228,6 +229,116 @@ impl XConnection {
                 y,
                 width: w,
                 height: h,
+            }],
+        )?;
+
+        Ok(())
+    }
+
+    /// Render a scaled thumbnail at animated position.
+    pub fn render_thumbnail_animated(
+        &self,
+        src_picture: Picture,
+        dst_picture: Picture,
+        src_width: u16,
+        src_height: u16,
+        layout: &AnimatedLayout,
+    ) -> Result<()> {
+        if layout.width == 0 || layout.height == 0 {
+            return Ok(());
+        }
+
+        let scale_x = src_width as f64 / layout.width as f64;
+        let scale_y = src_height as f64 / layout.height as f64;
+
+        let transform = Transform {
+            matrix11: double_to_fixed(scale_x),
+            matrix12: 0,
+            matrix13: 0,
+            matrix21: 0,
+            matrix22: double_to_fixed(scale_y),
+            matrix23: 0,
+            matrix31: 0,
+            matrix32: 0,
+            matrix33: double_to_fixed(1.0),
+        };
+
+        render::set_picture_transform(&self.conn, src_picture, transform)?;
+        render::set_picture_filter(&self.conn, src_picture, b"bilinear", &[])?;
+
+        render::composite(
+            &self.conn,
+            PictOp::SRC,
+            src_picture,
+            x11rb::NONE,
+            dst_picture,
+            0,
+            0,
+            0,
+            0,
+            layout.x,
+            layout.y,
+            layout.width,
+            layout.height,
+        )?;
+
+        Ok(())
+    }
+
+    /// Draw border around animated thumbnail.
+    pub fn draw_thumbnail_border_animated(
+        &self,
+        overview: &OverviewWindow,
+        layout: &AnimatedLayout,
+        highlighted: bool,
+    ) -> Result<()> {
+        let border_width: i16 = 3;
+
+        let color = if highlighted {
+            0x44_88_FF
+        } else {
+            0x44_44_44
+        };
+
+        self.conn.change_gc(
+            overview.gc,
+            &ChangeGCAux::new().foreground(color).line_width(border_width as u32),
+        )?;
+
+        let x = layout.x - border_width;
+        let y = layout.y - border_width;
+        let w = layout.width + 2 * border_width as u16;
+        let h = layout.height + 2 * border_width as u16;
+
+        self.conn.poly_rectangle(
+            overview.pixmap,
+            overview.gc,
+            &[Rectangle {
+                x,
+                y,
+                width: w,
+                height: h,
+            }],
+        )?;
+
+        Ok(())
+    }
+
+    /// Clear entire overview pixmap to background color.
+    pub fn clear_overview(&self, overview: &OverviewWindow) -> Result<()> {
+        let bg_color = 0x1a1a1a;
+
+        self.conn
+            .change_gc(overview.gc, &ChangeGCAux::new().foreground(bg_color))?;
+
+        self.conn.poly_fill_rectangle(
+            overview.pixmap,
+            overview.gc,
+            &[Rectangle {
+                x: 0,
+                y: 0,
+                width: overview.width,
+                height: overview.height,
             }],
         )?;
 
