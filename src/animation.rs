@@ -9,10 +9,16 @@ pub struct AnimationConfig {
     pub fps: u32,
 }
 
+impl AnimationConfig {
+    pub fn new(duration: Duration) -> Self {
+        Self { duration, fps: 60 }
+    }
+}
+
 impl Default for AnimationConfig {
     fn default() -> Self {
         Self {
-            duration: Duration::from_millis(500),
+            duration: Duration::from_millis(350),
             fps: 60,
         }
     }

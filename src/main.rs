@@ -1,5 +1,6 @@
 mod animation;
 mod capture;
+mod config;
 mod connection;
 mod error;
 mod input;
@@ -19,6 +20,7 @@ use std::thread;
 
 use animation::{calculate_exit_layouts, calculate_start_layouts, AnimationConfig, Animator};
 use capture::CapturedWindow;
+use config::Config;
 use connection::XConnection;
 use error::Result;
 use input::{InputAction, InputHandler};
@@ -38,6 +40,11 @@ fn main() {
 
 fn run() -> Result<()> {
     log::info!("Starting xpose");
+
+    // Load configuration
+    let config = Config::load();
+    let entrance_anim = AnimationConfig::new(config.entrance_duration());
+    let exit_anim = AnimationConfig::new(config.exit_duration());
 
     // Connect to X server
     let xconn = XConnection::new()?;
@@ -154,8 +161,7 @@ fn run() -> Result<()> {
         xconn.screen_height,
     );
 
-    let anim_config = AnimationConfig::default();
-    let animator = Animator::new(start_layouts, layouts.clone(), &anim_config);
+    let animator = Animator::new(start_layouts, layouts.clone(), &entrance_anim);
 
     // Animation loop - fade out skipped windows while animating managed windows
     while !animator.is_complete() {
@@ -316,7 +322,7 @@ fn run() -> Result<()> {
     // Run exit animation - fade in skipped windows while animating managed windows back
     {
         let (exit_start, exit_end) = calculate_exit_layouts(&windows_info, &layouts);
-        let exit_animator = Animator::new(exit_start, exit_end, &anim_config);
+        let exit_animator = Animator::new(exit_start, exit_end, &exit_anim);
 
         while !exit_animator.is_complete() {
             let progress = exit_animator.progress();
