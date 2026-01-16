@@ -387,12 +387,13 @@ fn run() -> Result<()> {
                 window_info.wm_name.as_deref().unwrap_or("(unnamed)")
             );
             xconn.raise_and_focus(window_info)?;
-            xconn.flush()?;
+            xconn.sync()?; // Round-trip to ensure raise is fully processed
         }
     }
 
     xconn.conn.ungrab_keyboard(x11rb::CURRENT_TIME)?;
     xconn.conn.ungrab_pointer(x11rb::CURRENT_TIME)?;
+    xconn.sync()?; // Ensure ungrabs are processed
     xconn.destroy_overview(&overview)?;
 
     for capture in &captures {

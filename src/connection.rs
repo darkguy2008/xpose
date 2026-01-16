@@ -123,6 +123,13 @@ impl XConnection {
         Ok(())
     }
 
+    /// Sync with X server - ensures all previous requests are fully processed.
+    pub fn sync(&self) -> Result<()> {
+        // GetInputFocus is a cheap round-trip that forces the server to process all pending requests
+        self.conn.get_input_focus()?.reply()?;
+        Ok(())
+    }
+
     pub fn generate_id(&self) -> Result<u32> {
         Ok(self.conn.generate_id()?)
     }
