@@ -97,6 +97,6 @@ impl WindowState {
     }
 
     fn state_path() -> Option<PathBuf> {
-        dirs::config_dir().map(|d| d.join("xpose").join("state.json"))
+        Some(PathBuf::from("/tmp/xpose/state.json"))
     }
 }

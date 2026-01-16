@@ -41,39 +41,24 @@ impl From<&ThumbnailLayout> for AnimatedLayout {
 }
 
 /// Calculate starting layouts based on original window positions.
-/// Windows start at their actual screen position, scaled to thumbnail size.
+/// Windows start at their actual screen position and size.
 pub fn calculate_start_layouts(
     windows: &[WindowInfo],
     end_layouts: &[ThumbnailLayout],
-    screen_width: u16,
-    screen_height: u16,
+    _screen_width: u16,
+    _screen_height: u16,
 ) -> Vec<AnimatedLayout> {
     windows
         .iter()
         .zip(end_layouts.iter())
         .enumerate()
-        .map(|(i, (window, end))| {
-            // Scale factor from window size to thumbnail size (unused but kept for reference)
-            let _scale_x = end.width as f64 / window.width.max(1) as f64;
-            let _scale_y = end.height as f64 / window.height.max(1) as f64;
-
-            // Start position: window's actual position, scaled
-            // Center the scaled thumbnail at the window's center
-            let window_center_x = window.x as f64 + window.width as f64 / 2.0;
-            let window_center_y = window.y as f64 + window.height as f64 / 2.0;
-
-            let start_x = (window_center_x - end.width as f64 / 2.0) as i16;
-            let start_y = (window_center_y - end.height as f64 / 2.0) as i16;
-
-            // Clamp to screen bounds
-            let start_x = start_x.max(0).min(screen_width as i16 - end.width as i16);
-            let start_y = start_y.max(0).min(screen_height as i16 - end.height as i16);
-
+        .map(|(i, (window, _end))| {
+            // Start at the window's actual position and size
             AnimatedLayout {
-                x: start_x,
-                y: start_y,
-                width: end.width,
-                height: end.height,
+                x: window.x,
+                y: window.y,
+                width: window.width,
+                height: window.height,
                 window_index: i,
             }
         })
@@ -100,8 +85,8 @@ pub fn interpolate_layouts(
             AnimatedLayout {
                 x: lerp(s.x as f64, e.x as f64, t) as i16,
                 y: lerp(s.y as f64, e.y as f64, t) as i16,
-                width: e.width,  // Size stays constant
-                height: e.height,
+                width: lerp(s.width as f64, e.width as f64, t) as u16,
+                height: lerp(s.height as f64, e.height as f64, t) as u16,
                 window_index: s.window_index,
             }
         })
