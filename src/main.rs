@@ -29,8 +29,12 @@ use renderer::OverviewWindow;
 use state::WindowState;
 
 fn main() {
-    // Initialize logging
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // Initialize logging to /tmp/xpose.log (recreated each run)
+    let log_file = std::fs::File::create("/tmp/xpose.log").expect("Failed to create log file");
+
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .target(env_logger::Target::Pipe(Box::new(log_file)))
+        .init();
 
     if let Err(e) = run() {
         log::error!("Error: {}", e);
@@ -55,7 +59,8 @@ fn run() -> Result<()> {
     );
 
     // Find all windows (managed and skipped)
-    let (mut windows, skipped_windows) = xconn.find_windows()?;
+    // original_stacking_order contains frame window IDs in their X11 stacking order (bottom-to-top)
+    let (mut windows, skipped_windows, original_stacking_order) = xconn.find_windows()?;
 
     if windows.is_empty() {
         log::info!("No windows to display");
@@ -324,6 +329,21 @@ fn run() -> Result<()> {
         let (exit_start, exit_end) = calculate_exit_layouts(&windows_info, &layouts);
         let exit_animator = Animator::new(exit_start, exit_end, &exit_anim);
 
+        // Build render order: original Z-order (bottom to top), with selected window last
+        // Map from original_stacking_order (frame IDs) to indices in captures array
+        let mut render_order: Vec<usize> = Vec::new();
+        for frame in &original_stacking_order {
+            if let Some(idx) = captures.iter().position(|c| c.info.frame_window == *frame) {
+                if Some(idx) != selected_window {
+                    render_order.push(idx);
+                }
+            }
+        }
+        // Add selected window last (renders on top)
+        if let Some(idx) = selected_window {
+            render_order.push(idx);
+        }
+
         while !exit_animator.is_complete() {
             let progress = exit_animator.progress();
             let current = exit_animator.current_layouts();
@@ -343,21 +363,8 @@ fn run() -> Result<()> {
                 )?;
             }
 
-            // Render non-selected windows first (no borders during exit)
-            for (i, (capture, layout)) in captures.iter().zip(current.iter()).enumerate() {
-                if Some(i) != selected_window {
-                    xconn.render_thumbnail_animated(
-                        capture.picture,
-                        overview.picture,
-                        capture.info.width,
-                        capture.info.height,
-                        layout,
-                    )?;
-                }
-            }
-
-            // Render selected window last (on top) if one was selected
-            if let Some(idx) = selected_window {
+            // Render windows in original Z-order (bottom to top), selected window last
+            for &idx in &render_order {
                 let layout = &current[idx];
                 xconn.render_thumbnail_animated(
                     captures[idx].picture,
@@ -376,6 +383,9 @@ fn run() -> Result<()> {
     // Cleanup
     log::debug!("Cleaning up");
 
+    // Restore original window stacking order before raising selected window
+    xconn.restore_stacking_order(&original_stacking_order)?;
+
     // Raise and focus selected window BEFORE destroying overview to avoid flicker
     if let Some(index) = selected_window {
         if index < captures.len() {
@@ -388,6 +398,9 @@ fn run() -> Result<()> {
             xconn.sync()?; // Round-trip to ensure raise is fully processed
         }
     }
+
+    // Log final Z-order for comparison
+    xconn.log_current_zorder(&original_stacking_order)?;
 
     xconn.conn.ungrab_keyboard(x11rb::CURRENT_TIME)?;
     xconn.conn.ungrab_pointer(x11rb::CURRENT_TIME)?;

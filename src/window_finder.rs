@@ -28,27 +28,34 @@ enum ExamineResult {
 
 impl XConnection {
     /// Enumerate all visible application windows.
-    /// Returns (managed_windows, skipped_windows).
+    /// Returns (managed_windows, skipped_windows, original_stacking_order).
     /// Skipped windows are visible but filtered out (docks, panels, etc.) - used for fade effect.
-    pub fn find_windows(&self) -> Result<(Vec<WindowInfo>, Vec<WindowInfo>)> {
+    /// original_stacking_order contains the frame window IDs of managed windows in their
+    /// original X11 stacking order (bottom-to-top), used to restore Z-order on exit.
+    pub fn find_windows(&self) -> Result<(Vec<WindowInfo>, Vec<WindowInfo>, Vec<Window>)> {
         let mut windows = Vec::new();
         let mut skipped = Vec::new();
+        let mut original_stacking_order = Vec::new();
 
         // Get all children of root (these are TWM frame windows)
+        // tree.children is in X11 stacking order (bottom-to-top)
         let tree = self.conn.query_tree(self.root)?.reply()?;
 
         for frame_window in tree.children {
             match self.examine_frame(frame_window) {
                 Ok(ExamineResult::Managed(info)) => {
                     log::debug!(
-                        "Found window: {:?} ({:?}) at {}x{}+{}+{}",
+                        "Found window: {:?} ({:?}) frame=0x{:x} at {}x{}+{}+{}",
                         info.wm_name,
                         info.wm_class,
+                        info.frame_window,
                         info.width,
                         info.height,
                         info.x,
                         info.y
                     );
+                    // Save frame in original stacking order (bottom-to-top)
+                    original_stacking_order.push(info.frame_window);
                     windows.push(info);
                 }
                 Ok(ExamineResult::Skipped(info)) => {
@@ -75,7 +82,20 @@ impl XConnection {
             windows.len(),
             skipped.len()
         );
-        Ok((windows, skipped))
+
+        // Log initial Z-order for debugging
+        log::info!("=== INITIAL Z-ORDER (bottom to top) ===");
+        for (i, win) in windows.iter().enumerate() {
+            log::info!(
+                "  [{}] frame=0x{:x} {:?}",
+                i,
+                win.frame_window,
+                win.wm_name.as_deref().unwrap_or("(unnamed)")
+            );
+        }
+        log::info!("========================================");
+
+        Ok((windows, skipped, original_stacking_order))
     }
 
     /// Examine a potential frame window to find the client window inside.
@@ -374,6 +394,70 @@ impl XConnection {
         }
 
         Ok(false)
+    }
+
+    /// Query and log the current Z-order of managed windows.
+    /// Takes the list of frame windows we care about.
+    pub fn log_current_zorder(&self, managed_frames: &[Window]) -> Result<()> {
+        let tree = self.conn.query_tree(self.root)?.reply()?;
+
+        log::info!("=== CURRENT Z-ORDER (bottom to top) ===");
+        let mut idx = 0;
+        for frame in &tree.children {
+            if managed_frames.contains(frame) {
+                // Get window name for logging
+                if let Some(client) = self.find_client_window(*frame)? {
+                    let name = self.get_wm_name(client).ok().flatten();
+                    log::info!(
+                        "  [{}] frame=0x{:x} {:?}",
+                        idx,
+                        frame,
+                        name.as_deref().unwrap_or("(unnamed)")
+                    );
+                    idx += 1;
+                }
+            }
+        }
+        log::info!("========================================");
+        Ok(())
+    }
+
+    /// Restore windows to their original stacking order.
+    /// Takes the original stacking order (frame window IDs, bottom-to-top).
+    pub fn restore_stacking_order(&self, original_order: &[Window]) -> Result<()> {
+        if original_order.len() < 2 {
+            return Ok(()); // Nothing to restack
+        }
+
+        log::debug!(
+            "Restoring stacking order for {} windows (bottom-to-top): {:?}",
+            original_order.len(),
+            original_order.iter().map(|w| format!("0x{:x}", w)).collect::<Vec<_>>()
+        );
+
+        // Restack windows in order: each window goes ABOVE the previous one
+        // This restores the original bottom-to-top order
+        for i in 1..original_order.len() {
+            let window = original_order[i];
+            let sibling = original_order[i - 1];
+
+            log::debug!(
+                "Stacking 0x{:x} ABOVE 0x{:x}",
+                window,
+                sibling
+            );
+
+            self.conn.configure_window(
+                window,
+                &ConfigureWindowAux::new()
+                    .sibling(sibling)
+                    .stack_mode(StackMode::ABOVE),
+            )?;
+        }
+
+        self.conn.flush()?;
+        log::debug!("Stacking order restored");
+        Ok(())
     }
 
     /// Raise and focus a window.
