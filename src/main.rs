@@ -4,6 +4,7 @@ mod error;
 mod input;
 mod layout;
 mod renderer;
+mod state;
 mod window_finder;
 
 use std::collections::HashSet;
@@ -19,6 +20,7 @@ use error::Result;
 use input::{InputAction, InputHandler};
 use layout::{calculate_layout, LayoutConfig, ThumbnailLayout};
 use renderer::OverviewWindow;
+use state::WindowState;
 
 fn main() {
     // Initialize logging
@@ -42,11 +44,26 @@ fn run() -> Result<()> {
     );
 
     // Find all windows
-    let windows = xconn.find_windows()?;
+    let mut windows = xconn.find_windows()?;
 
     if windows.is_empty() {
         log::info!("No windows to display");
         return Ok(());
+    }
+
+    // Load saved state and apply consistent ordering
+    let mut window_state = WindowState::load();
+    let current_hash = WindowState::compute_hash(&windows);
+
+    if current_hash == window_state.window_set_hash {
+        // Same window set - restore saved order
+        log::debug!("Restoring saved window order");
+        window_state.sort_windows(&mut windows);
+    } else {
+        // Window set changed - use new order and update state
+        log::debug!("Window set changed, using fresh layout");
+        window_state.update_from_windows(&windows);
+        window_state.save();
     }
 
     // Capture window contents

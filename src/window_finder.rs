@@ -133,7 +133,7 @@ impl XConnection {
             )?
             .reply()?;
 
-        Ok(reply.type_ != AtomEnum::NONE.into())
+        Ok(reply.type_ != u32::from(AtomEnum::NONE))
     }
 
     /// Get WM_CLASS property (instance and class names).
@@ -143,7 +143,7 @@ impl XConnection {
             .get_property(false, window, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 256)?
             .reply()?;
 
-        if reply.type_ == AtomEnum::NONE.into() || reply.value.is_empty() {
+        if reply.type_ == u32::from(AtomEnum::NONE) || reply.value.is_empty() {
             return Ok(None);
         }
 
@@ -159,7 +159,7 @@ impl XConnection {
             .get_property(false, window, AtomEnum::WM_NAME, AtomEnum::ANY, 0, 256)?
             .reply()?;
 
-        if reply.type_ == AtomEnum::NONE.into() || reply.value.is_empty() {
+        if reply.type_ == u32::from(AtomEnum::NONE) || reply.value.is_empty() {
             return Ok(None);
         }
 
@@ -208,7 +208,7 @@ impl XConnection {
             .conn
             .get_property(false, window, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 0)?
             .reply()?;
-        Ok(reply.type_ != AtomEnum::NONE.into())
+        Ok(reply.type_ != u32::from(AtomEnum::NONE))
     }
 
     /// Check if window type is NORMAL (or unset, which defaults to NORMAL).
@@ -227,7 +227,7 @@ impl XConnection {
             .reply()?;
 
         // No _NET_WM_WINDOW_TYPE set = assume NORMAL
-        if reply.type_ == AtomEnum::NONE.into() || reply.value.is_empty() {
+        if reply.type_ == u32::from(AtomEnum::NONE) || reply.value.is_empty() {
             return Ok(true);
         }
 
@@ -276,7 +276,7 @@ impl XConnection {
             )?
             .reply()?;
 
-        if reply.type_ == AtomEnum::NONE.into() || reply.value.is_empty() {
+        if reply.type_ == u32::from(AtomEnum::NONE) || reply.value.is_empty() {
             return Ok(false);
         }
 
@@ -307,7 +307,7 @@ impl XConnection {
             )?
             .reply()?;
 
-        Ok(reply.type_ != AtomEnum::NONE.into() && !reply.value.is_empty())
+        Ok(reply.type_ != u32::from(AtomEnum::NONE) && !reply.value.is_empty())
     }
 
     /// Check if window requests no decorations via _MOTIF_WM_HINTS.
@@ -326,7 +326,7 @@ impl XConnection {
             )?
             .reply()?;
 
-        if reply.type_ == AtomEnum::NONE.into() || reply.value.is_empty() {
+        if reply.type_ == u32::from(AtomEnum::NONE) || reply.value.is_empty() {
             return Ok(false);
         }
 
