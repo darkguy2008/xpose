@@ -20,17 +20,99 @@ pub struct OverviewWindow {
     pub gc: Gcontext,
     pub width: u16,
     pub height: u16,
+    pub bg_picture: Option<Picture>,
 }
 
 impl XConnection {
+    /// Attempt to get the root window background pixmap.
+    /// Checks _XROOTPMAP_ID first, then ESETROOT_PMAP_ID.
+    /// Returns None if no background is set.
+    fn get_root_background_pixmap(&self) -> Result<Option<Pixmap>> {
+        // Try _XROOTPMAP_ID first (most common - used by feh, nitrogen, hsetroot)
+        let reply = self.conn.get_property(
+            false,
+            self.root,
+            self.atoms._XROOTPMAP_ID,
+            AtomEnum::PIXMAP,
+            0,
+            1,
+        )?.reply()?;
+
+        if reply.type_ != u32::from(AtomEnum::NONE) && !reply.value.is_empty() {
+            if let Some(mut values) = reply.value32() {
+                if let Some(pixmap_id) = values.next() {
+                    if pixmap_id != 0 {
+                        log::debug!("Found root background via _XROOTPMAP_ID: 0x{:x}", pixmap_id);
+                        return Ok(Some(pixmap_id));
+                    }
+                }
+            }
+        }
+
+        // Fallback to ESETROOT_PMAP_ID
+        let reply = self.conn.get_property(
+            false,
+            self.root,
+            self.atoms.ESETROOT_PMAP_ID,
+            AtomEnum::PIXMAP,
+            0,
+            1,
+        )?.reply()?;
+
+        if reply.type_ != u32::from(AtomEnum::NONE) && !reply.value.is_empty() {
+            if let Some(mut values) = reply.value32() {
+                if let Some(pixmap_id) = values.next() {
+                    if pixmap_id != 0 {
+                        log::debug!("Found root background via ESETROOT_PMAP_ID: 0x{:x}", pixmap_id);
+                        return Ok(Some(pixmap_id));
+                    }
+                }
+            }
+        }
+
+        log::debug!("No root background pixmap found");
+        Ok(None)
+    }
+
     /// Create the fullscreen overview window.
     pub fn create_overview_window(&self) -> Result<OverviewWindow> {
         let window = self.generate_id()?;
         let pixmap = self.generate_id()?;
         let gc = self.generate_id()?;
 
-        // Dark background color (0x1a1a1a)
+        // Dark background color (fallback)
         let bg_color = 0x1a1a1a;
+
+        // Try to get root background pixmap and create a picture from it
+        let bg_picture = match self.get_root_background_pixmap() {
+            Ok(Some(root_pixmap)) => {
+                let pic = self.generate_id()?;
+                match render::create_picture(
+                    &self.conn,
+                    pic,
+                    root_pixmap,
+                    self.pict_format_rgb,
+                    &render::CreatePictureAux::new(),
+                ) {
+                    Ok(_) => {
+                        log::info!("Created background picture from root wallpaper");
+                        Some(pic)
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to create picture from root background: {}", e);
+                        None
+                    }
+                }
+            }
+            Ok(None) => {
+                log::info!("No root background found, using solid color");
+                None
+            }
+            Err(e) => {
+                log::warn!("Error getting root background: {}", e);
+                None
+            }
+        };
 
         // Create fullscreen window
         self.conn.create_window(
@@ -69,18 +151,6 @@ impl XConnection {
         self.conn
             .create_gc(gc, window, &CreateGCAux::new().foreground(bg_color))?;
 
-        // Fill pixmap with background color
-        self.conn.poly_fill_rectangle(
-            pixmap,
-            gc,
-            &[Rectangle {
-                x: 0,
-                y: 0,
-                width: self.screen_width,
-                height: self.screen_height,
-            }],
-        )?;
-
         // Create picture for the pixmap
         let picture = self.generate_id()?;
         render::create_picture(
@@ -91,6 +161,33 @@ impl XConnection {
             &render::CreatePictureAux::new(),
         )?;
 
+        // Fill pixmap with background (wallpaper or solid color)
+        if let Some(bg_pic) = bg_picture {
+            render::composite(
+                &self.conn,
+                PictOp::SRC,
+                bg_pic,
+                x11rb::NONE,
+                picture,
+                0, 0,
+                0, 0,
+                0, 0,
+                self.screen_width,
+                self.screen_height,
+            )?;
+        } else {
+            self.conn.poly_fill_rectangle(
+                pixmap,
+                gc,
+                &[Rectangle {
+                    x: 0,
+                    y: 0,
+                    width: self.screen_width,
+                    height: self.screen_height,
+                }],
+            )?;
+        }
+
         self.conn.flush()?;
 
         Ok(OverviewWindow {
@@ -100,6 +197,7 @@ impl XConnection {
             gc,
             width: self.screen_width,
             height: self.screen_height,
+            bg_picture,
         })
     }
 
@@ -211,26 +309,40 @@ impl XConnection {
         layout: &ThumbnailLayout,
     ) -> Result<()> {
         let border_width: i16 = 5;
-        let bg_color = 0x1a1a1a;
-
-        self.conn
-            .change_gc(overview.gc, &ChangeGCAux::new().foreground(bg_color))?;
 
         let x = layout.x - border_width;
         let y = layout.y - border_width;
         let w = layout.width + 2 * border_width as u16;
         let h = layout.height + 2 * border_width as u16;
 
-        self.conn.poly_fill_rectangle(
-            overview.pixmap,
-            overview.gc,
-            &[Rectangle {
-                x,
-                y,
-                width: w,
-                height: h,
-            }],
-        )?;
+        if let Some(bg_pic) = overview.bg_picture {
+            render::composite(
+                &self.conn,
+                PictOp::SRC,
+                bg_pic,
+                x11rb::NONE,
+                overview.picture,
+                x, y,
+                0, 0,
+                x, y,
+                w,
+                h,
+            )?;
+        } else {
+            let bg_color = 0x1a1a1a;
+            self.conn
+                .change_gc(overview.gc, &ChangeGCAux::new().foreground(bg_color))?;
+            self.conn.poly_fill_rectangle(
+                overview.pixmap,
+                overview.gc,
+                &[Rectangle {
+                    x,
+                    y,
+                    width: w,
+                    height: h,
+                }],
+            )?;
+        }
 
         Ok(())
     }
@@ -392,23 +504,36 @@ impl XConnection {
         Ok(())
     }
 
-    /// Clear entire overview pixmap to background color.
+    /// Clear entire overview pixmap to background (wallpaper or solid color).
     pub fn clear_overview(&self, overview: &OverviewWindow) -> Result<()> {
-        let bg_color = 0x1a1a1a;
-
-        self.conn
-            .change_gc(overview.gc, &ChangeGCAux::new().foreground(bg_color))?;
-
-        self.conn.poly_fill_rectangle(
-            overview.pixmap,
-            overview.gc,
-            &[Rectangle {
-                x: 0,
-                y: 0,
-                width: overview.width,
-                height: overview.height,
-            }],
-        )?;
+        if let Some(bg_pic) = overview.bg_picture {
+            render::composite(
+                &self.conn,
+                PictOp::SRC,
+                bg_pic,
+                x11rb::NONE,
+                overview.picture,
+                0, 0,
+                0, 0,
+                0, 0,
+                overview.width,
+                overview.height,
+            )?;
+        } else {
+            let bg_color = 0x1a1a1a;
+            self.conn
+                .change_gc(overview.gc, &ChangeGCAux::new().foreground(bg_color))?;
+            self.conn.poly_fill_rectangle(
+                overview.pixmap,
+                overview.gc,
+                &[Rectangle {
+                    x: 0,
+                    y: 0,
+                    width: overview.width,
+                    height: overview.height,
+                }],
+            )?;
+        }
 
         Ok(())
     }
@@ -432,6 +557,10 @@ impl XConnection {
 
     /// Destroy overview window and free resources.
     pub fn destroy_overview(&self, overview: &OverviewWindow) -> Result<()> {
+        // Free the background picture if we created one
+        if let Some(bg_pic) = overview.bg_picture {
+            render::free_picture(&self.conn, bg_pic)?;
+        }
         render::free_picture(&self.conn, overview.picture)?;
         self.conn.free_gc(overview.gc)?;
         self.conn.free_pixmap(overview.pixmap)?;

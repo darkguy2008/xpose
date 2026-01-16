@@ -39,6 +39,9 @@ atom_manager! {
         _NET_WM_STATE_SKIP_PAGER,
         // Motif hints for decoration detection
         _MOTIF_WM_HINTS,
+        // Root window background pixmap atoms
+        _XROOTPMAP_ID,
+        ESETROOT_PMAP_ID,
     }
 }
 
