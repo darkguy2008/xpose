@@ -17,7 +17,7 @@ use x11rb::protocol::Event;
 
 use std::thread;
 
-use animation::{calculate_start_layouts, AnimationConfig, Animator};
+use animation::{calculate_exit_layouts, calculate_start_layouts, AnimationConfig, Animator};
 use capture::CapturedWindow;
 use connection::XConnection;
 use error::Result;
@@ -47,8 +47,8 @@ fn run() -> Result<()> {
         xconn.screen_height
     );
 
-    // Find all windows
-    let mut windows = xconn.find_windows()?;
+    // Find all windows (managed and skipped)
+    let (mut windows, skipped_windows) = xconn.find_windows()?;
 
     if windows.is_empty() {
         log::info!("No windows to display");
@@ -70,7 +70,7 @@ fn run() -> Result<()> {
         window_state.save();
     }
 
-    // Capture window contents
+    // Capture window contents (managed windows)
     let mut captures: Vec<CapturedWindow> = Vec::new();
     for window in &windows {
         match xconn.capture_window(window) {
@@ -82,6 +82,15 @@ fn run() -> Result<()> {
     if captures.is_empty() {
         log::info!("No windows could be captured");
         return Ok(());
+    }
+
+    // Capture skipped windows (for fade effect)
+    let mut skipped_captures: Vec<CapturedWindow> = Vec::new();
+    for window in &skipped_windows {
+        match xconn.capture_window(window) {
+            Ok(capture) => skipped_captures.push(capture),
+            Err(e) => log::warn!("Failed to capture skipped window {:?}: {}", window.wm_name, e),
+        }
     }
 
     // Calculate layout
@@ -148,12 +157,28 @@ fn run() -> Result<()> {
     let anim_config = AnimationConfig::default();
     let animator = Animator::new(start_layouts, layouts.clone(), &anim_config);
 
-    // Animation loop
+    // Animation loop - fade out skipped windows while animating managed windows
     while !animator.is_complete() {
+        let progress = animator.progress();
         let current = animator.current_layouts();
 
         xconn.clear_overview(&overview)?;
 
+        // Render skipped windows with fading opacity (1.0 → 0.0)
+        let skip_opacity = 1.0 - progress;
+        for capture in &skipped_captures {
+            xconn.render_window_with_opacity(
+                capture.picture,
+                overview.picture,
+                capture.info.x,
+                capture.info.y,
+                capture.info.width,
+                capture.info.height,
+                skip_opacity,
+            )?;
+        }
+
+        // Render managed windows animating to grid
         for (capture, layout) in captures.iter().zip(current.iter()) {
             xconn.render_thumbnail_animated(
                 capture.picture,
@@ -288,6 +313,62 @@ fn run() -> Result<()> {
         }
     }
 
+    // Run exit animation - fade in skipped windows while animating managed windows back
+    {
+        let (exit_start, exit_end) = calculate_exit_layouts(&windows_info, &layouts);
+        let exit_animator = Animator::new(exit_start, exit_end, &anim_config);
+
+        while !exit_animator.is_complete() {
+            let progress = exit_animator.progress();
+            let current = exit_animator.current_layouts();
+
+            xconn.clear_overview(&overview)?;
+
+            // Render skipped windows with fading in opacity (0.0 → 1.0)
+            for capture in &skipped_captures {
+                xconn.render_window_with_opacity(
+                    capture.picture,
+                    overview.picture,
+                    capture.info.x,
+                    capture.info.y,
+                    capture.info.width,
+                    capture.info.height,
+                    progress,
+                )?;
+            }
+
+            // Render non-selected windows first
+            for (i, (capture, layout)) in captures.iter().zip(current.iter()).enumerate() {
+                if Some(i) != selected_window {
+                    xconn.render_thumbnail_animated(
+                        capture.picture,
+                        overview.picture,
+                        capture.info.width,
+                        capture.info.height,
+                        layout,
+                    )?;
+                    xconn.draw_thumbnail_border_animated(&overview, layout, false)?;
+                }
+            }
+
+            // Render selected window last (on top) if one was selected
+            if let Some(idx) = selected_window {
+                let layout = &current[idx];
+                xconn.render_thumbnail_animated(
+                    captures[idx].picture,
+                    overview.picture,
+                    captures[idx].info.width,
+                    captures[idx].info.height,
+                    layout,
+                )?;
+                xconn.draw_thumbnail_border_animated(&overview, layout, false)?;
+            }
+
+            xconn.present_overview(&overview)?;
+            thread::sleep(exit_animator.frame_duration());
+        }
+    }
+
     // Cleanup
     log::debug!("Cleaning up");
 
@@ -298,6 +379,12 @@ fn run() -> Result<()> {
     for capture in &captures {
         if let Err(e) = xconn.release_capture(capture) {
             log::warn!("Failed to release capture: {}", e);
+        }
+    }
+
+    for capture in &skipped_captures {
+        if let Err(e) = xconn.release_capture(capture) {
+            log::warn!("Failed to release skipped capture: {}", e);
         }
     }
 

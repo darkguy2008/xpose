@@ -26,6 +26,9 @@ impl XConnection {
         let pixmap = self.generate_id()?;
         composite::name_window_pixmap(&self.conn, info.frame_window, pixmap)?;
 
+        // Get actual pixmap geometry (may differ from frame geometry)
+        let pixmap_geom = self.conn.get_geometry(pixmap)?.reply()?;
+
         // Create XRender picture from pixmap
         let picture = self.generate_id()?;
         render::create_picture(
@@ -43,16 +46,23 @@ impl XConnection {
 
         self.conn.flush()?;
 
+        // Update info with actual pixmap dimensions
+        let mut captured_info = info.clone();
+        captured_info.width = pixmap_geom.width;
+        captured_info.height = pixmap_geom.height;
+
         log::debug!(
-            "Captured window {:?} -> pixmap 0x{:x}, picture 0x{:x}, damage 0x{:x}",
+            "Captured window {:?} -> pixmap 0x{:x} ({}x{}), picture 0x{:x}, damage 0x{:x}",
             info.wm_name,
             pixmap,
+            pixmap_geom.width,
+            pixmap_geom.height,
             picture,
             damage_id
         );
 
         Ok(CapturedWindow {
-            info: info.clone(),
+            info: captured_info,
             pixmap,
             picture,
             damage: damage_id,

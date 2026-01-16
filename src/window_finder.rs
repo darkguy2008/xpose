@@ -16,18 +16,30 @@ pub struct WindowInfo {
     pub wm_name: Option<String>,
 }
 
+/// Result of examining a frame window.
+enum ExamineResult {
+    /// A managed application window.
+    Managed(WindowInfo),
+    /// A visible window that was skipped (dock, panel, etc.) - contains full info for rendering.
+    Skipped(WindowInfo),
+    /// Not a visible window (override-redirect, unmapped, tiny).
+    Ignored,
+}
+
 impl XConnection {
     /// Enumerate all visible application windows.
-    /// Uses EWMH hints to filter out non-application windows.
-    pub fn find_windows(&self) -> Result<Vec<WindowInfo>> {
+    /// Returns (managed_windows, skipped_windows).
+    /// Skipped windows are visible but filtered out (docks, panels, etc.) - used for fade effect.
+    pub fn find_windows(&self) -> Result<(Vec<WindowInfo>, Vec<WindowInfo>)> {
         let mut windows = Vec::new();
+        let mut skipped = Vec::new();
 
         // Get all children of root (these are TWM frame windows)
         let tree = self.conn.query_tree(self.root)?.reply()?;
 
         for frame_window in tree.children {
             match self.examine_frame(frame_window) {
-                Ok(Some(info)) => {
+                Ok(ExamineResult::Managed(info)) => {
                     log::debug!(
                         "Found window: {:?} ({:?}) at {}x{}+{}+{}",
                         info.wm_name,
@@ -39,7 +51,18 @@ impl XConnection {
                     );
                     windows.push(info);
                 }
-                Ok(None) => {}
+                Ok(ExamineResult::Skipped(info)) => {
+                    log::debug!(
+                        "Skipped visible window: {:?} at {}x{}+{}+{}",
+                        info.wm_name,
+                        info.width,
+                        info.height,
+                        info.x,
+                        info.y
+                    );
+                    skipped.push(info);
+                }
+                Ok(ExamineResult::Ignored) => {}
                 Err(e) => {
                     // Window may have been destroyed, skip it
                     log::debug!("Error examining frame 0x{:x}: {}", frame_window, e);
@@ -47,24 +70,28 @@ impl XConnection {
             }
         }
 
-        log::info!("Found {} application windows", windows.len());
-        Ok(windows)
+        log::info!(
+            "Found {} application windows, {} skipped visible windows",
+            windows.len(),
+            skipped.len()
+        );
+        Ok((windows, skipped))
     }
 
     /// Examine a potential frame window to find the client window inside.
     /// Applies EWMH-based filtering to exclude non-application windows.
-    fn examine_frame(&self, frame: Window) -> Result<Option<WindowInfo>> {
+    fn examine_frame(&self, frame: Window) -> Result<ExamineResult> {
         // Get frame attributes
         let attrs = self.conn.get_window_attributes(frame)?.reply()?;
 
         // Skip override-redirect windows (menus, tooltips, popups)
         if attrs.override_redirect {
-            return Ok(None);
+            return Ok(ExamineResult::Ignored);
         }
 
         // Skip unmapped windows
         if attrs.map_state != MapState::VIEWABLE {
-            return Ok(None);
+            return Ok(ExamineResult::Ignored);
         }
 
         // Get frame geometry
@@ -72,20 +99,15 @@ impl XConnection {
 
         // Skip tiny windows (1x1 placeholders used by some apps)
         if geom.width <= 1 || geom.height <= 1 {
-            return Ok(None);
+            return Ok(ExamineResult::Ignored);
         }
 
         // Find client window with WM_STATE property
         if let Some(client) = self.find_client_window(frame)? {
-            // Apply EWMH-based filtering on the client window
-            if self.should_skip_window(client)? {
-                return Ok(None);
-            }
-
             let wm_class = self.get_wm_class(client).ok().flatten();
             let wm_name = self.get_wm_name(client).ok().flatten();
 
-            return Ok(Some(WindowInfo {
+            let info = WindowInfo {
                 client_window: client,
                 frame_window: frame,
                 x: geom.x,
@@ -94,10 +116,18 @@ impl XConnection {
                 height: geom.height,
                 wm_class,
                 wm_name,
-            }));
+            };
+
+            // Apply EWMH-based filtering on the client window
+            if self.should_skip_window(client)? {
+                // This is a visible window but filtered by EWMH - track it for fade effect
+                return Ok(ExamineResult::Skipped(info));
+            }
+
+            return Ok(ExamineResult::Managed(info));
         }
 
-        Ok(None)
+        Ok(ExamineResult::Ignored)
     }
 
     /// Depth-first search for a window with WM_STATE property.

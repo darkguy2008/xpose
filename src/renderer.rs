@@ -285,6 +285,74 @@ impl XConnection {
         Ok(())
     }
 
+    /// Render a window at its original position with opacity (for skipped windows fade effect).
+    pub fn render_window_with_opacity(
+        &self,
+        src_picture: Picture,
+        dst_picture: Picture,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+        opacity: f64,
+    ) -> Result<()> {
+        if width == 0 || height == 0 || opacity <= 0.0 {
+            return Ok(());
+        }
+
+        // Reset transform to identity (1:1 rendering)
+        let transform = Transform {
+            matrix11: double_to_fixed(1.0),
+            matrix12: 0,
+            matrix13: 0,
+            matrix21: 0,
+            matrix22: double_to_fixed(1.0),
+            matrix23: 0,
+            matrix31: 0,
+            matrix32: 0,
+            matrix33: double_to_fixed(1.0),
+        };
+
+        render::set_picture_transform(&self.conn, src_picture, transform)?;
+        render::set_picture_filter(&self.conn, src_picture, b"nearest", &[])?;
+
+        // Create solid fill for alpha mask
+        let alpha = (opacity.clamp(0.0, 1.0) * 65535.0) as u16;
+        let mask_picture = self.generate_id()?;
+        render::create_solid_fill(
+            &self.conn,
+            mask_picture,
+            render::Color {
+                red: alpha,
+                green: alpha,
+                blue: alpha,
+                alpha,
+            },
+        )?;
+
+        // Composite with alpha mask using OVER operator
+        render::composite(
+            &self.conn,
+            PictOp::OVER,
+            src_picture,
+            mask_picture,
+            dst_picture,
+            0,
+            0,
+            0,
+            0,
+            x,
+            y,
+            width,
+            height,
+        )?;
+
+        // Free the mask picture
+        render::free_picture(&self.conn, mask_picture)?;
+
+        Ok(())
+    }
+
     /// Draw border around animated thumbnail.
     pub fn draw_thumbnail_border_animated(
         &self,

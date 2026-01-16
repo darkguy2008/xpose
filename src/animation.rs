@@ -65,6 +65,31 @@ pub fn calculate_start_layouts(
         .collect()
 }
 
+/// Calculate layouts for exit animation (reverse of entrance).
+/// Start at grid positions, end at original window positions.
+pub fn calculate_exit_layouts(
+    windows: &[WindowInfo],
+    grid_layouts: &[ThumbnailLayout],
+) -> (Vec<AnimatedLayout>, Vec<ThumbnailLayout>) {
+    // Start: current grid positions
+    let start_layouts: Vec<AnimatedLayout> = grid_layouts.iter().map(AnimatedLayout::from).collect();
+
+    // End: original window positions
+    let end_layouts: Vec<ThumbnailLayout> = windows
+        .iter()
+        .enumerate()
+        .map(|(i, window)| ThumbnailLayout {
+            x: window.x,
+            y: window.y,
+            width: window.width,
+            height: window.height,
+            window_index: i,
+        })
+        .collect();
+
+    (start_layouts, end_layouts)
+}
+
 /// Ease-out cubic function for smooth deceleration.
 fn ease_out_cubic(t: f64) -> f64 {
     1.0 - (1.0 - t).powi(3)
