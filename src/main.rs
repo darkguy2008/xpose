@@ -169,6 +169,12 @@ fn run() -> Result<()> {
 
     let animator = Animator::new(start_layouts, layouts.clone(), &entrance_anim);
 
+    // Build render order from original Z-order (bottom to top)
+    let render_order: Vec<usize> = original_stacking_order
+        .iter()
+        .filter_map(|frame| captures.iter().position(|c| c.info.frame_window == *frame))
+        .collect();
+
     // Animation loop - fade out skipped windows while animating managed windows
     while !animator.is_complete() {
         let progress = animator.progress();
@@ -190,13 +196,14 @@ fn run() -> Result<()> {
             )?;
         }
 
-        // Render managed windows animating to grid
-        for (capture, layout) in captures.iter().zip(current.iter()) {
+        // Render managed windows in original Z-order (bottom to top)
+        for &idx in &render_order {
+            let layout = &current[idx];
             xconn.render_thumbnail_animated(
-                capture.picture,
+                captures[idx].picture,
                 overview.picture,
-                capture.info.width,
-                capture.info.height,
+                captures[idx].info.width,
+                captures[idx].info.height,
                 layout,
             )?;
             xconn.draw_thumbnail_border_animated(&overview, layout, false)?;
