@@ -60,7 +60,8 @@ fn run() -> Result<()> {
 
     // Find all windows (managed and skipped)
     // original_stacking_order contains frame window IDs in their X11 stacking order (bottom-to-top)
-    let (mut windows, skipped_windows, original_stacking_order) = xconn.find_windows()?;
+    let (mut windows, skipped_windows, original_stacking_order) =
+        xconn.find_windows(&config.exclude_classes)?;
 
     if windows.is_empty() {
         log::info!("No windows to display");

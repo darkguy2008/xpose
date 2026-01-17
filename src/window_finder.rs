@@ -32,7 +32,11 @@ impl XConnection {
     /// Skipped windows are visible but filtered out (docks, panels, etc.) - used for fade effect.
     /// original_stacking_order contains the frame window IDs of managed windows in their
     /// original X11 stacking order (bottom-to-top), used to restore Z-order on exit.
-    pub fn find_windows(&self) -> Result<(Vec<WindowInfo>, Vec<WindowInfo>, Vec<Window>)> {
+    /// `exclude_classes` is a list of WM_CLASS values to exclude from the exposé view.
+    pub fn find_windows(
+        &self,
+        exclude_classes: &[String],
+    ) -> Result<(Vec<WindowInfo>, Vec<WindowInfo>, Vec<Window>)> {
         let mut windows = Vec::new();
         let mut skipped = Vec::new();
         let mut original_stacking_order = Vec::new();
@@ -44,19 +48,37 @@ impl XConnection {
         for frame_window in tree.children {
             match self.examine_frame(frame_window) {
                 Ok(ExamineResult::Managed(info)) => {
-                    log::debug!(
-                        "Found window: {:?} ({:?}) frame=0x{:x} at {}x{}+{}+{}",
-                        info.wm_name,
-                        info.wm_class,
-                        info.frame_window,
-                        info.width,
-                        info.height,
-                        info.x,
-                        info.y
-                    );
-                    // Save frame in original stacking order (bottom-to-top)
-                    original_stacking_order.push(info.frame_window);
-                    windows.push(info);
+                    // Check if this window's class is in the exclude list
+                    // WM_CLASS contains "instance class" (e.g. "xpad xpad" or "org.gnome.Boxes Org.gnome.Boxes")
+                    let is_excluded = info.wm_class.as_ref().map_or(false, |class| {
+                        exclude_classes.iter().any(|exc| {
+                            // Check if any part of WM_CLASS matches the exclude pattern
+                            class.split_whitespace().any(|part| part.eq_ignore_ascii_case(exc))
+                        })
+                    });
+
+                    if is_excluded {
+                        log::debug!(
+                            "Excluding window by class: {:?} ({:?})",
+                            info.wm_name,
+                            info.wm_class
+                        );
+                        skipped.push(info);
+                    } else {
+                        log::debug!(
+                            "Found window: {:?} ({:?}) frame=0x{:x} at {}x{}+{}+{}",
+                            info.wm_name,
+                            info.wm_class,
+                            info.frame_window,
+                            info.width,
+                            info.height,
+                            info.x,
+                            info.y
+                        );
+                        // Save frame in original stacking order (bottom-to-top)
+                        original_stacking_order.push(info.frame_window);
+                        windows.push(info);
+                    }
                 }
                 Ok(ExamineResult::Skipped(info)) => {
                     log::debug!(
@@ -243,12 +265,6 @@ impl XConnection {
             return Ok(true);
         }
 
-        // Skip windows without decorations (sticky notes, etc.)
-        if self.has_no_decorations(window)? {
-            log::debug!("Skipping window 0x{:x}: no decorations", window);
-            return Ok(true);
-        }
-
         Ok(false)
     }
 
@@ -358,42 +374,6 @@ impl XConnection {
             .reply()?;
 
         Ok(reply.type_ != u32::from(AtomEnum::NONE) && !reply.value.is_empty())
-    }
-
-    /// Check if window requests no decorations via _MOTIF_WM_HINTS.
-    /// Format: flags(u32), functions(u32), decorations(u32), input_mode(i32), status(u32)
-    /// If flags bit 1 (0x2) is set and decorations == 0, window wants no decorations.
-    fn has_no_decorations(&self, window: Window) -> Result<bool> {
-        let reply = self
-            .conn
-            .get_property(
-                false,
-                window,
-                self.atoms._MOTIF_WM_HINTS,
-                self.atoms._MOTIF_WM_HINTS,
-                0,
-                5,
-            )?
-            .reply()?;
-
-        if reply.type_ == u32::from(AtomEnum::NONE) || reply.value.is_empty() {
-            return Ok(false);
-        }
-
-        if let Some(mut values) = reply.value32() {
-            let flags = values.next().unwrap_or(0);
-            let _functions = values.next().unwrap_or(0);
-            let decorations = values.next().unwrap_or(1);
-
-            // MWM_HINTS_DECORATIONS = 0x2
-            const MWM_HINTS_DECORATIONS: u32 = 0x2;
-
-            if (flags & MWM_HINTS_DECORATIONS) != 0 && decorations == 0 {
-                return Ok(true);
-            }
-        }
-
-        Ok(false)
     }
 
     /// Query and log the current Z-order of managed windows.

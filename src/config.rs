@@ -5,6 +5,8 @@ use std::time::Duration;
 pub struct Config {
     pub entrance_ms: u64,
     pub exit_ms: u64,
+    /// WM_CLASS values to exclude from the exposé view
+    pub exclude_classes: Vec<String>,
 }
 
 impl Default for Config {
@@ -12,6 +14,7 @@ impl Default for Config {
         Self {
             entrance_ms: 350,
             exit_ms: 350,
+            exclude_classes: Vec::new(),
         }
     }
 }
@@ -63,6 +66,10 @@ impl Config {
                         config.exit_ms = ms;
                         log::debug!("Config: ExitMs = {}", ms);
                     }
+                }
+                "ExcludeClass" => {
+                    config.exclude_classes.push(value.to_string());
+                    log::debug!("Config: ExcludeClass = {}", value);
                 }
                 _ => {
                     log::debug!("Config: unknown key '{}'", key);
