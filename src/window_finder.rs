@@ -109,9 +109,11 @@ impl XConnection {
         log::info!("=== INITIAL Z-ORDER (bottom to top) ===");
         for (i, win) in windows.iter().enumerate() {
             log::info!(
-                "  [{}] frame=0x{:x} {:?}",
+                "  [{}] frame=0x{:x} {}x{} {:?}",
                 i,
                 win.frame_window,
+                win.width,
+                win.height,
                 win.wm_name.as_deref().unwrap_or("(unnamed)")
             );
         }
