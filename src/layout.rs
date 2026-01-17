@@ -52,18 +52,7 @@ pub fn calculate_layout(
     let cell_width = available_width.saturating_sub(total_h_padding) / cols as u16;
     let cell_height = available_height.saturating_sub(total_v_padding) / rows as u16;
 
-    // Calculate window centers in normalized [0,1] screen coordinates
-    let window_centers: Vec<(usize, f64, f64)> = windows
-        .iter()
-        .enumerate()
-        .map(|(i, w)| {
-            let center_x = (w.x as f64 + w.width as f64 / 2.0) / screen_width as f64;
-            let center_y = (w.y as f64 + w.height as f64 / 2.0) / screen_height as f64;
-            (i, center_x.clamp(0.0, 1.0), center_y.clamp(0.0, 1.0))
-        })
-        .collect();
-
-    // Calculate grid cell centers based on ACTUAL rendered positions
+    // Grid dimensions for cell center calculations
     let grid_width = (cols as u16 * cell_width) + ((cols as u16).saturating_sub(1) * config.padding);
     let grid_height = (rows as u16 * cell_height) + ((rows as u16).saturating_sub(1) * config.padding);
     let grid_offset_x = (screen_width.saturating_sub(grid_width)) / 2;
@@ -72,61 +61,87 @@ pub fn calculate_layout(
     let windows_in_last_row = count % cols;
     let last_row_cols = if windows_in_last_row == 0 { cols } else { windows_in_last_row };
 
-    let cell_centers: Vec<(usize, f64, f64)> = (0..count)
-        .map(|cell_idx| {
-            let col = cell_idx % cols;
-            let row = cell_idx / cols;
+    let cell_assignments = if rows == 1 {
+        // Single row: sort by X position to preserve left-to-right ordering
+        let mut indexed: Vec<(usize, f64)> = windows
+            .iter()
+            .enumerate()
+            .map(|(i, w)| (i, w.x as f64 + w.width as f64 / 2.0))
+            .collect();
+        indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
-            // Account for last row centering
-            let row_offset_x = if row == rows - 1 && last_row_cols < cols {
-                let last_row_width = (last_row_cols as u16 * cell_width) +
-                    ((last_row_cols as u16).saturating_sub(1) * config.padding);
-                (grid_width.saturating_sub(last_row_width)) / 2
-            } else {
-                0
-            };
+        let mut assignments = vec![0; count];
+        for (cell_idx, (win_idx, _)) in indexed.iter().enumerate() {
+            assignments[*win_idx] = cell_idx;
+        }
+        assignments
+    } else {
+        // Multi-row: use spatial matching (greedy assignment to nearest cell)
+        let window_centers: Vec<(usize, f64, f64)> = windows
+            .iter()
+            .enumerate()
+            .map(|(i, w)| {
+                let center_x = (w.x as f64 + w.width as f64 / 2.0) / screen_width as f64;
+                let center_y = (w.y as f64 + w.height as f64 / 2.0) / screen_height as f64;
+                (i, center_x.clamp(0.0, 1.0), center_y.clamp(0.0, 1.0))
+            })
+            .collect();
 
-            // Actual cell center in screen coordinates
-            let cell_x = grid_offset_x + row_offset_x +
-                col as u16 * (cell_width + config.padding) + cell_width / 2;
-            let cell_y = grid_offset_y +
-                row as u16 * (cell_height + config.padding) + cell_height / 2;
+        let cell_centers: Vec<(usize, f64, f64)> = (0..count)
+            .map(|cell_idx| {
+                let col = cell_idx % cols;
+                let row = cell_idx / cols;
 
-            // Normalize to [0,1]
-            (cell_idx, cell_x as f64 / screen_width as f64, cell_y as f64 / screen_height as f64)
-        })
-        .collect();
+                // Account for last row centering
+                let row_offset_x = if row == rows - 1 && last_row_cols < cols {
+                    let last_row_width = (last_row_cols as u16 * cell_width) +
+                        ((last_row_cols as u16).saturating_sub(1) * config.padding);
+                    (grid_width.saturating_sub(last_row_width)) / 2
+                } else {
+                    0
+                };
 
-    // Greedy assignment: repeatedly find the closest window-cell pair
-    // This assigns each window to the grid cell nearest its screen position
-    let mut cell_assignments: Vec<usize> = vec![usize::MAX; count];
-    let mut used_cells: Vec<bool> = vec![false; count];
+                // Actual cell center in screen coordinates
+                let cell_x = grid_offset_x + row_offset_x +
+                    col as u16 * (cell_width + config.padding) + cell_width / 2;
+                let cell_y = grid_offset_y +
+                    row as u16 * (cell_height + config.padding) + cell_height / 2;
 
-    for _ in 0..count {
-        let mut best_dist = f64::MAX;
-        let mut best_window = 0;
-        let mut best_cell = 0;
+                // Normalize to [0,1]
+                (cell_idx, cell_x as f64 / screen_width as f64, cell_y as f64 / screen_height as f64)
+            })
+            .collect();
 
-        for &(win_idx, wx, wy) in &window_centers {
-            if cell_assignments[win_idx] != usize::MAX {
-                continue; // already assigned
-            }
-            for &(cell_idx, cx, cy) in &cell_centers {
-                if used_cells[cell_idx] {
+        let mut assignments: Vec<usize> = vec![usize::MAX; count];
+        let mut used_cells: Vec<bool> = vec![false; count];
+
+        for _ in 0..count {
+            let mut best_dist = f64::MAX;
+            let mut best_window = 0;
+            let mut best_cell = 0;
+
+            for &(win_idx, wx, wy) in &window_centers {
+                if assignments[win_idx] != usize::MAX {
                     continue;
                 }
-                let dist = (wx - cx).powi(2) + (wy - cy).powi(2);
-                if dist < best_dist {
-                    best_dist = dist;
-                    best_window = win_idx;
-                    best_cell = cell_idx;
+                for &(cell_idx, cx, cy) in &cell_centers {
+                    if used_cells[cell_idx] {
+                        continue;
+                    }
+                    let dist = (wx - cx).powi(2) + (wy - cy).powi(2);
+                    if dist < best_dist {
+                        best_dist = dist;
+                        best_window = win_idx;
+                        best_cell = cell_idx;
+                    }
                 }
             }
-        }
 
-        cell_assignments[best_window] = best_cell;
-        used_cells[best_cell] = true;
-    }
+            assignments[best_window] = best_cell;
+            used_cells[best_cell] = true;
+        }
+        assignments
+    };
 
     // Build layouts based on assignments
     let mut layouts = Vec::with_capacity(count);
