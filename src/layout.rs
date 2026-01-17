@@ -58,9 +58,6 @@ pub fn calculate_layout(
     let grid_offset_x = (screen_width.saturating_sub(grid_width)) / 2;
     let grid_offset_y = (screen_height.saturating_sub(grid_height)) / 2;
 
-    let windows_in_last_row = count % cols;
-    let last_row_cols = if windows_in_last_row == 0 { cols } else { windows_in_last_row };
-
     let cell_assignments = if rows == 1 {
         // Single row: sort by X position to preserve left-to-right ordering
         let mut indexed: Vec<(usize, f64)> = windows
@@ -76,72 +73,92 @@ pub fn calculate_layout(
         }
         assignments
     } else {
-        // Multi-row: use spatial matching (greedy assignment to nearest cell)
-        let window_centers: Vec<(usize, f64, f64)> = windows
+        // Multi-row: assign windows to rows by Y position, then sort within rows by X
+        let mut indexed: Vec<(usize, f64, f64)> = windows
             .iter()
             .enumerate()
             .map(|(i, w)| {
-                let center_x = (w.x as f64 + w.width as f64 / 2.0) / screen_width as f64;
-                let center_y = (w.y as f64 + w.height as f64 / 2.0) / screen_height as f64;
-                (i, center_x.clamp(0.0, 1.0), center_y.clamp(0.0, 1.0))
+                let center_x = w.x as f64 + w.width as f64 / 2.0;
+                let center_y = w.y as f64 + w.height as f64 / 2.0;
+                (i, center_x, center_y)
             })
             .collect();
 
-        let cell_centers: Vec<(usize, f64, f64)> = (0..count)
-            .map(|cell_idx| {
-                let col = cell_idx % cols;
-                let row = cell_idx / cols;
+        // Sort by Y to determine row assignment
+        indexed.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
 
-                // Account for last row centering
-                let row_offset_x = if row == rows - 1 && last_row_cols < cols {
-                    let last_row_width = (last_row_cols as u16 * cell_width) +
-                        ((last_row_cols as u16).saturating_sub(1) * config.padding);
-                    (grid_width.saturating_sub(last_row_width)) / 2
-                } else {
-                    0
-                };
+        log::debug!("Grid: {}x{} for {} windows", cols, rows, count);
+        log::debug!("=== WINDOW POSITIONS (sorted by Y) ===");
+        for (i, (win_idx, x, y)) in indexed.iter().enumerate() {
+            log::debug!("  [{}] window {} at (x={:.1}, y={:.1})", i, win_idx, x, y);
+        }
+        log::debug!("========================================");
 
-                // Actual cell center in screen coordinates
-                let cell_x = grid_offset_x + row_offset_x +
-                    col as u16 * (cell_width + config.padding) + cell_width / 2;
-                let cell_y = grid_offset_y +
-                    row as u16 * (cell_height + config.padding) + cell_height / 2;
+        // Assign windows to rows based on Y quantiles
+        let mut row_buckets: Vec<Vec<(usize, f64, f64)>> = vec![Vec::new(); rows];
 
-                // Normalize to [0,1]
-                (cell_idx, cell_x as f64 / screen_width as f64, cell_y as f64 / screen_height as f64)
-            })
-            .collect();
+        for (i, &(win_idx, x, y)) in indexed.iter().enumerate() {
+            // Calculate which row this window belongs to based on its position in sorted list
+            // Distribute windows as evenly as possible across rows
+            let row = (i * rows) / count;
+            log::debug!(
+                "Window {} (sorted_pos={}, y={:.1}) → ROW {} (formula: {}*{}/{} = {})",
+                win_idx, i, y, row, i, rows, count, row
+            );
+            row_buckets[row].push((win_idx, x, y));
+        }
 
-        let mut assignments: Vec<usize> = vec![usize::MAX; count];
-        let mut used_cells: Vec<bool> = vec![false; count];
+        // Sort each row by X position and assign to cells
+        let mut assignments = vec![0; count];
 
-        for _ in 0..count {
-            let mut best_dist = f64::MAX;
-            let mut best_window = 0;
-            let mut best_cell = 0;
+        for (row, mut bucket) in row_buckets.into_iter().enumerate() {
+            log::debug!("=== ROW {} ({} windows) ===", row, bucket.len());
 
-            for &(win_idx, wx, wy) in &window_centers {
-                if assignments[win_idx] != usize::MAX {
-                    continue;
-                }
-                for &(cell_idx, cx, cy) in &cell_centers {
-                    if used_cells[cell_idx] {
-                        continue;
-                    }
-                    let dist = (wx - cx).powi(2) + (wy - cy).powi(2);
-                    if dist < best_dist {
-                        best_dist = dist;
-                        best_window = win_idx;
-                        best_cell = cell_idx;
-                    }
-                }
+            // Sort this row by X (left to right)
+            bucket.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+
+            log::debug!("Windows in row {} after X-sort:", row);
+            for (pos, (win_idx, x, y)) in bucket.iter().enumerate() {
+                log::debug!("  [{}] window {} at (x={:.1}, y={:.1})", pos, win_idx, x, y);
             }
 
-            assignments[best_window] = best_cell;
-            used_cells[best_cell] = true;
+            // Assign to cells - position in row + row offset
+            for (position, (win_idx, x, y)) in bucket.into_iter().enumerate() {
+                let cell_idx = row * cols + position;  // FIX: Respect grid structure
+                let col = cell_idx % cols;
+                let row_check = cell_idx / cols;
+
+                log::debug!(
+                    "  Assigning window {} (x={:.1}, y={:.1}) → cell {} = (col={}, row={})",
+                    win_idx, x, y, cell_idx, col, row_check
+                );
+
+                assignments[win_idx] = cell_idx;
+            }
         }
+
+        log::debug!("=== FINAL CELL ASSIGNMENTS ===");
+        for (win_idx, &cell_idx) in assignments.iter().enumerate() {
+            let col = cell_idx % cols;
+            let row = cell_idx / cols;
+            log::debug!(
+                "  Window {} → cell {} = (col={}, row={})",
+                win_idx, cell_idx, col, row
+            );
+        }
+        log::debug!("================================");
+
         assignments
     };
+
+    // Count windows per row to determine which rows need centering
+    let mut windows_per_row = vec![0usize; rows];
+    for &cell_idx in &cell_assignments {
+        let row = cell_idx / cols;
+        windows_per_row[row] += 1;
+    }
+
+    log::debug!("Windows per row: {:?}", windows_per_row);
 
     // Build layouts based on assignments
     let mut layouts = Vec::with_capacity(count);
@@ -151,16 +168,17 @@ pub fn calculate_layout(
         let col = cell_idx % cols;
         let row = cell_idx / cols;
 
-        // For the last row, center it if it has fewer items
-        let row_offset_x = if row == rows - 1 && last_row_cols < cols {
-            let last_row_width = (last_row_cols as u16 * cell_width) +
-                ((last_row_cols as u16).saturating_sub(1) * config.padding);
-            (grid_width.saturating_sub(last_row_width)) / 2
+        // Center any row that has fewer items than columns
+        let row_window_count = windows_per_row[row];
+        let row_offset_x = if row_window_count < cols {
+            let row_width = (row_window_count as u16 * cell_width) +
+                ((row_window_count as u16).saturating_sub(1) * config.padding);
+            (grid_width.saturating_sub(row_width)) / 2
         } else {
             0
         };
 
-        // Calculate cell position (centered grid + row centering for last row)
+        // Calculate cell position (centered grid + row centering for partial rows)
         let cell_x = grid_offset_x as i16 + row_offset_x as i16 +
             (col as u16 * (cell_width + config.padding)) as i16;
         let cell_y = grid_offset_y as i16 +
