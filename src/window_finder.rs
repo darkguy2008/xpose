@@ -261,9 +261,10 @@ impl XConnection {
             return Ok(true);
         }
 
-        // Skip transient windows (dialogs)
-        if self.is_transient(window)? {
-            log::debug!("Skipping window 0x{:x}: transient window", window);
+        // Skip transient windows only if they have DIALOG type
+        // (GTK apps use WM_TRANSIENT_FOR for legitimate windows like settings sheets)
+        if self.is_transient(window)? && self.has_dialog_type(window)? {
+            log::debug!("Skipping window 0x{:x}: transient dialog", window);
             return Ok(true);
         }
 
@@ -353,6 +354,35 @@ impl XConnection {
                 if state == self.atoms._NET_WM_STATE_SKIP_TASKBAR
                     || state == self.atoms._NET_WM_STATE_SKIP_PAGER
                 {
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Check if window has _NET_WM_WINDOW_TYPE_DIALOG.
+    fn has_dialog_type(&self, window: Window) -> Result<bool> {
+        let reply = self
+            .conn
+            .get_property(
+                false,
+                window,
+                self.atoms._NET_WM_WINDOW_TYPE,
+                AtomEnum::ATOM,
+                0,
+                32,
+            )?
+            .reply()?;
+
+        if reply.type_ == u32::from(AtomEnum::NONE) || reply.value.is_empty() {
+            return Ok(false);
+        }
+
+        if let Some(types) = reply.value32() {
+            for window_type in types {
+                if window_type == self.atoms._NET_WM_WINDOW_TYPE_DIALOG {
                     return Ok(true);
                 }
             }
