@@ -1072,6 +1072,64 @@ impl XConnection {
         Ok(())
     }
 
+    /// Render a delete button (X) on a desktop preview.
+    pub fn render_delete_button(
+        &self,
+        overview: &OverviewWindow,
+        x: i16,
+        y: i16,
+        size: u16,
+        is_hovered: bool,
+    ) -> Result<()> {
+        // Background (dark red, brighter when hovered)
+        let bg_color = if is_hovered { 0xCC4444 } else { 0x884444 };
+        self.conn
+            .change_gc(overview.gc, &ChangeGCAux::new().foreground(bg_color))?;
+        self.conn.poly_fill_rectangle(
+            overview.pixmap,
+            overview.gc,
+            &[Rectangle {
+                x,
+                y,
+                width: size,
+                height: size,
+            }],
+        )?;
+
+        // Draw "X" symbol
+        let x_color = 0xFFFFFF;
+        let line_width = 2u16;
+        let margin = size / 4;
+        self.conn.change_gc(
+            overview.gc,
+            &ChangeGCAux::new()
+                .foreground(x_color)
+                .line_width(line_width as u32),
+        )?;
+
+        // Diagonal lines forming X
+        self.conn.poly_segment(
+            overview.pixmap,
+            overview.gc,
+            &[
+                Segment {
+                    x1: x + margin as i16,
+                    y1: y + margin as i16,
+                    x2: x + (size - margin) as i16,
+                    y2: y + (size - margin) as i16,
+                },
+                Segment {
+                    x1: x + (size - margin) as i16,
+                    y1: y + margin as i16,
+                    x2: x + margin as i16,
+                    y2: y + (size - margin) as i16,
+                },
+            ],
+        )?;
+
+        Ok(())
+    }
+
     /// Render a desktop preview at an animated position/size (for zoom animation).
     /// This renders the wallpaper and mini-windows scaled to the given rectangle.
     pub fn render_desktop_preview_animated(

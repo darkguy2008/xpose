@@ -145,6 +145,39 @@ impl GridTransitionAnimation {
     }
 }
 
+/// Animation state for desktop bar layout changes (slide left/right after deletion/reorder).
+struct DesktopBarAnimation {
+    /// Map from desktop_index to (old_x, new_x)
+    transitions: std::collections::HashMap<u32, (i16, i16)>,
+    start_time: Instant,
+    duration_ms: u64,
+}
+
+impl DesktopBarAnimation {
+    fn progress(&self) -> f64 {
+        let elapsed = self.start_time.elapsed().as_millis() as f64;
+        let duration = self.duration_ms as f64;
+        (elapsed / duration).min(1.0)
+    }
+
+    fn is_complete(&self) -> bool {
+        self.progress() >= 1.0
+    }
+
+    /// Get interpolated X position for a desktop
+    fn current_x(&self, desktop_index: u32, original_x: i16) -> i16 {
+        let t = self.progress();
+        // Ease-out cubic for smooth deceleration
+        let eased = 1.0 - (1.0 - t).powi(3);
+
+        if let Some(&(old_x, new_x)) = self.transitions.get(&desktop_index) {
+            (old_x as f64 + (new_x - old_x) as f64 * eased) as i16
+        } else {
+            original_x
+        }
+    }
+}
+
 /// Calculate drag scale factor and target size based on Y position.
 /// Interpolates from drag start position (scale=1.0) to desktop preview bottom (scale=target_scale).
 fn calculate_drag_scale_and_target(
@@ -610,7 +643,7 @@ fn run() -> Result<()> {
         xconn.clear_overview(&overview)?;
         if let Some(ref bar) = desktop_bar {
             let bar_y_offset = -(bar_height as i16);
-            render_desktop_bar(&xconn, &overview, bar, bar_y_offset, None, &captures)?;
+            render_desktop_bar(&xconn, &overview, bar, bar_y_offset, None, None, &captures)?;
         }
         // Render skipped windows at full opacity (matches progress=0 in animation loop).
         for capture in &skipped_captures {
@@ -672,7 +705,7 @@ fn run() -> Result<()> {
         // Render desktop bar (with slide-in animation)
         if let Some(ref bar) = desktop_bar {
             let bar_y_offset = (-(bar_height as f64) * (1.0 - progress)) as i16;
-            render_desktop_bar(&xconn, &overview, bar, bar_y_offset, None, &captures)?;
+            render_desktop_bar(&xconn, &overview, bar, bar_y_offset, None, None, &captures)?;
         }
 
         // Render skipped windows with fading opacity (1.0 → 0.0)
@@ -709,7 +742,7 @@ fn run() -> Result<()> {
 
     // Render final static state
     if let Some(ref bar) = desktop_bar {
-        render_desktop_bar(&xconn, &overview, bar, 0, None, &captures)?;
+        render_desktop_bar(&xconn, &overview, bar, 0, None, None, &captures)?;
     }
     render_all_thumbnails(&xconn, &captures, &layouts, &overview, None, None)?;
     xconn.present_overview(&overview)?;
@@ -741,6 +774,11 @@ fn run() -> Result<()> {
 
     // Grid transition animation state
     let mut grid_transition_animation: Option<GridTransitionAnimation> = None;
+
+    // Desktop drag state
+    let mut desktop_dragging: Option<u32> = None;
+    let mut desktop_insert_position: Option<u32> = None;
+    let mut desktop_bar_animation: Option<DesktopBarAnimation> = None;
 
     loop {
         // Process all pending events (non-blocking after first)
@@ -846,7 +884,184 @@ fn run() -> Result<()> {
                     // Redraw
                     xconn.clear_overview(&overview)?;
                     if let Some(ref bar) = desktop_bar {
-                        render_desktop_bar(&xconn, &overview, bar, 0, input_handler.hovered_desktop(), &captures)?;
+                        render_desktop_bar(&xconn, &overview, bar, 0, input_handler.hovered_desktop(), None, &captures)?;
+                    }
+                    render_all_thumbnails(&xconn, &captures, &layouts, &overview, last_hovered, dragging_window_index)?;
+                    needs_present = true;
+                }
+                InputAction::DeleteDesktop(idx) => {
+                    log::info!("Deleting desktop {}", idx);
+
+                    // Can't delete the last desktop
+                    if desktop_state.desktops <= 1 {
+                        log::warn!("Cannot delete the last desktop");
+                    } else {
+                        // Store old bar positions for animation
+                        let old_bar = desktop_bar.clone();
+
+                        // Perform deletion
+                        if let Err(e) = desktop::delete_desktop(&xconn, &mut desktop_state, idx) {
+                            log::warn!("Failed to delete desktop: {}", e);
+                        } else {
+                            // Recreate desktop bar with new count
+                            desktop_bar = Some(DesktopBar::new(
+                                desktop_state.desktops,
+                                desktop_state.current,
+                                xconn.screen_width,
+                            ));
+
+                            // Start slide animation for remaining desktops
+                            if let (Some(old), Some(ref new_bar)) = (old_bar, &desktop_bar) {
+                                let mut transitions = std::collections::HashMap::new();
+                                for new_preview in &new_bar.preview_layouts {
+                                    // Find corresponding old preview (accounting for index shift)
+                                    let old_idx = if new_preview.desktop_index >= idx {
+                                        new_preview.desktop_index + 1
+                                    } else {
+                                        new_preview.desktop_index
+                                    };
+                                    if let Some(old_preview) = old.preview_layouts.iter()
+                                        .find(|p| p.desktop_index == old_idx)
+                                    {
+                                        if old_preview.x != new_preview.x {
+                                            transitions.insert(new_preview.desktop_index, (old_preview.x, new_preview.x));
+                                        }
+                                    }
+                                }
+                                if !transitions.is_empty() {
+                                    desktop_bar_animation = Some(DesktopBarAnimation {
+                                        transitions,
+                                        start_time: std::time::Instant::now(),
+                                        duration_ms: 250,
+                                    });
+                                }
+                            }
+
+                            if let Some(ref mut bar) = desktop_bar {
+                                bar.calculate_mini_layouts(
+                                    &captures,
+                                    &desktop_state,
+                                    xconn.screen_width,
+                                    xconn.screen_height,
+                                );
+                            }
+                            input_handler.update_desktop_bar(desktop_bar.clone());
+
+                            // Update removed_windows based on new desktop state
+                            let old_removed = removed_windows.clone();
+                            removed_windows = captures
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, capture)| {
+                                    !desktop_state.is_visible_on(capture.info.frame_window, desktop_state.current)
+                                })
+                                .map(|(i, _)| i)
+                                .collect();
+
+                            // Move windows that are now on current desktop back on-screen
+                            // (they were moved off-screen at startup because they were on other desktops)
+                            for (i, capture) in captures.iter().enumerate() {
+                                if old_removed.contains(&i) && !removed_windows.contains(&i) {
+                                    // This window was off-screen but is now on current desktop
+                                    log::info!("Moving window {:?} back on-screen after desktop deletion",
+                                              capture.info.wm_name);
+                                    xconn.conn.configure_window(
+                                        capture.info.frame_window,
+                                        &ConfigureWindowAux::new().x(capture.info.x as i32),
+                                    )?;
+                                }
+                            }
+                            xconn.flush()?;
+
+                            // Recalculate grid layout for current desktop
+                            layouts = recalculate_filtered_layout(
+                                &captures,
+                                &removed_windows,
+                                xconn.screen_width,
+                                xconn.screen_height,
+                                &config,
+                                bar_height,
+                            );
+                            input_handler.update_layouts(layouts.clone());
+
+                            // Redraw
+                            xconn.clear_overview(&overview)?;
+                            if let Some(ref bar) = desktop_bar {
+                                render_desktop_bar(&xconn, &overview, bar, 0, input_handler.hovered_desktop(), None, &captures)?;
+                            }
+                            render_all_thumbnails(&xconn, &captures, &layouts, &overview, last_hovered, dragging_window_index)?;
+                            needs_present = true;
+                        }
+                    }
+                }
+                InputAction::StartDesktopDrag(desktop_idx) => {
+                    log::info!("Started dragging desktop {}", desktop_idx);
+                    desktop_dragging = Some(desktop_idx);
+                    needs_present = true;
+                }
+                InputAction::DesktopDragMove(cursor_x, _cursor_y) => {
+                    if let (Some(dragged), Some(ref bar)) = (desktop_dragging, &desktop_bar) {
+                        // Calculate insert position
+                        desktop_insert_position = Some(bar.calculate_insert_position(cursor_x, dragged));
+
+                        // Render desktop bar with gap
+                        xconn.clear_overview(&overview)?;
+                        render_desktop_bar_with_drag(
+                            &xconn,
+                            &overview,
+                            bar,
+                            dragged,
+                            desktop_insert_position,
+                            cursor_x,
+                            &captures,
+                        )?;
+                        render_all_thumbnails(&xconn, &captures, &layouts, &overview, last_hovered, dragging_window_index)?;
+                        needs_present = true;
+                    }
+                }
+                InputAction::DropDesktopAt(from_desktop, to_position) => {
+                    log::info!("Reordering desktop {} to position {}", from_desktop, to_position);
+
+                    if let Err(e) = desktop::reorder_desktop(&xconn, &mut desktop_state, from_desktop, to_position) {
+                        log::warn!("Failed to reorder desktop: {}", e);
+                    } else {
+                        // Recreate desktop bar
+                        desktop_bar = Some(DesktopBar::new(
+                            desktop_state.desktops,
+                            desktop_state.current,
+                            xconn.screen_width,
+                        ));
+                        if let Some(ref mut bar) = desktop_bar {
+                            bar.calculate_mini_layouts(
+                                &captures,
+                                &desktop_state,
+                                xconn.screen_width,
+                                xconn.screen_height,
+                            );
+                        }
+                        input_handler.update_desktop_bar(desktop_bar.clone());
+                    }
+
+                    desktop_dragging = None;
+                    desktop_insert_position = None;
+
+                    // Redraw
+                    xconn.clear_overview(&overview)?;
+                    if let Some(ref bar) = desktop_bar {
+                        render_desktop_bar(&xconn, &overview, bar, 0, input_handler.hovered_desktop(), None, &captures)?;
+                    }
+                    render_all_thumbnails(&xconn, &captures, &layouts, &overview, last_hovered, dragging_window_index)?;
+                    needs_present = true;
+                }
+                InputAction::CancelDesktopDrag => {
+                    log::debug!("Desktop drag cancelled");
+                    desktop_dragging = None;
+                    desktop_insert_position = None;
+
+                    // Redraw without gap
+                    xconn.clear_overview(&overview)?;
+                    if let Some(ref bar) = desktop_bar {
+                        render_desktop_bar(&xconn, &overview, bar, 0, input_handler.hovered_desktop(), None, &captures)?;
                     }
                     render_all_thumbnails(&xconn, &captures, &layouts, &overview, last_hovered, dragging_window_index)?;
                     needs_present = true;
@@ -880,7 +1095,7 @@ fn run() -> Result<()> {
 
                             xconn.clear_overview(&overview)?;
                             if let Some(ref bar) = desktop_bar {
-                                render_desktop_bar(&xconn, &overview, bar, 0, input_handler.hovered_desktop(), &captures)?;
+                                render_desktop_bar(&xconn, &overview, bar, 0, input_handler.hovered_desktop(), None, &captures)?;
                             }
                             render_all_thumbnails(&xconn, &captures, &layouts, &overview, last_hovered, dragging_window_index)?;
                             xconn.render_dragged_window(
@@ -912,7 +1127,7 @@ fn run() -> Result<()> {
 
                         xconn.clear_overview(&overview)?;
                         if let Some(ref bar) = desktop_bar {
-                            render_desktop_bar(&xconn, &overview, bar, 0, input_handler.hovered_desktop(), &captures)?;
+                            render_desktop_bar(&xconn, &overview, bar, 0, input_handler.hovered_desktop(), None, &captures)?;
                         }
                         render_all_thumbnails(&xconn, &captures, &layouts, &overview, last_hovered, dragging_window_index)?;
                         xconn.render_dragged_window(
@@ -985,7 +1200,7 @@ fn run() -> Result<()> {
                     log::debug!("Hover desktop: {:?}", desktop_idx);
                     // Redraw desktop bar with hover highlight
                     if let Some(ref bar) = desktop_bar {
-                        render_desktop_bar(&xconn, &overview, bar, 0, desktop_idx, &captures)?;
+                        render_desktop_bar(&xconn, &overview, bar, 0, desktop_idx, None, &captures)?;
                         needs_present = true;
                     }
                 }
@@ -1018,7 +1233,7 @@ fn run() -> Result<()> {
             }
             // Also re-render the desktop bar so mini-thumbnails update
             if let Some(ref bar) = desktop_bar {
-                render_desktop_bar(&xconn, &overview, bar, 0, input_handler.hovered_desktop(), &captures)?;
+                render_desktop_bar(&xconn, &overview, bar, 0, input_handler.hovered_desktop(), None, &captures)?;
             }
             damaged_windows.clear();
             needs_present = true;
@@ -1041,7 +1256,7 @@ fn run() -> Result<()> {
                 }
                 // Re-render desktop bar with updated captures
                 if let Some(ref bar) = desktop_bar {
-                    render_desktop_bar(&xconn, &overview, bar, 0, input_handler.hovered_desktop(), &captures)?;
+                    render_desktop_bar(&xconn, &overview, bar, 0, input_handler.hovered_desktop(), None, &captures)?;
                 }
                 needs_present = true;
             }
@@ -1054,7 +1269,7 @@ fn run() -> Result<()> {
 
             xconn.clear_overview(&overview)?;
             if let Some(ref bar) = desktop_bar {
-                render_desktop_bar(&xconn, &overview, bar, 0, None, &captures)?;
+                render_desktop_bar(&xconn, &overview, bar, 0, None, None, &captures)?;
             }
             // Hide the animating window from the grid during animation
             render_all_thumbnails(&xconn, &captures, &layouts, &overview, last_hovered, dragging_window_index)?;
@@ -1140,7 +1355,7 @@ fn run() -> Result<()> {
 
             xconn.clear_overview(&overview)?;
             if let Some(ref bar) = desktop_bar {
-                render_desktop_bar(&xconn, &overview, bar, 0, None, &captures)?;
+                render_desktop_bar(&xconn, &overview, bar, 0, None, None, &captures)?;
             }
 
             // Render thumbnails at interpolated positions
@@ -1161,7 +1376,7 @@ fn run() -> Result<()> {
                 // Final render with exact final positions
                 xconn.clear_overview(&overview)?;
                 if let Some(ref bar) = desktop_bar {
-                    render_desktop_bar(&xconn, &overview, bar, 0, None, &captures)?;
+                    render_desktop_bar(&xconn, &overview, bar, 0, None, None, &captures)?;
                 }
                 render_all_thumbnails(&xconn, &captures, &layouts, &overview, last_hovered, None)?;
                 needs_present = true;
@@ -1477,6 +1692,7 @@ fn render_desktop_bar(
     desktop_bar: &DesktopBar,
     bar_y_offset: i16,
     hovered_desktop: Option<u32>,
+    hovered_delete_button: Option<u32>,
     captures: &[CapturedWindow],
 ) -> Result<()> {
     // Render bar background
@@ -1492,11 +1708,114 @@ fn render_desktop_bar(
             is_hovered,
             bar_y_offset,
         )?;
+
+        // Render delete button if more than 1 desktop
+        if desktop_bar.num_desktops > 1 {
+            let del_x = preview.x + preview.delete_button_x;
+            let del_y = preview.y + preview.delete_button_y + bar_y_offset;
+            let is_del_hovered = hovered_delete_button == Some(preview.desktop_index);
+            xconn.render_delete_button(
+                overview,
+                del_x,
+                del_y,
+                preview.delete_button_size,
+                is_del_hovered,
+            )?;
+        }
     }
 
     // Render plus button
     let pb = &desktop_bar.plus_button;
     xconn.render_plus_button(overview, pb.x, pb.y + bar_y_offset, pb.size, false)?;
+
+    Ok(())
+}
+
+/// Render the desktop bar with a desktop being dragged (shows gap for insertion).
+fn render_desktop_bar_with_drag(
+    xconn: &XConnection,
+    overview: &OverviewWindow,
+    desktop_bar: &DesktopBar,
+    dragged_desktop: u32,
+    insert_position: Option<u32>,
+    cursor_x: i16,
+    captures: &[CapturedWindow],
+) -> Result<()> {
+    use crate::desktop_bar::PREVIEW_WIDTH;
+
+    // Render bar background
+    xconn.render_desktop_bar_background(overview, desktop_bar.bar_height, 0)?;
+
+    // Calculate layouts with gap
+    let gap_layouts = if let Some(insert_pos) = insert_position {
+        desktop_bar.calculate_layouts_with_gap(dragged_desktop, insert_pos)
+    } else {
+        desktop_bar
+            .preview_layouts
+            .iter()
+            .filter(|p| p.desktop_index != dragged_desktop)
+            .map(|p| (p.desktop_index, p.x))
+            .collect()
+    };
+
+    // Render non-dragged previews at their gap-adjusted positions
+    for (desktop_idx, x) in gap_layouts {
+        if let Some(preview) = desktop_bar
+            .preview_layouts
+            .iter()
+            .find(|p| p.desktop_index == desktop_idx)
+        {
+            let mut adjusted_preview = preview.clone();
+            adjusted_preview.x = x;
+            xconn.render_desktop_preview_full(
+                overview,
+                &adjusted_preview,
+                captures,
+                false,
+                0,
+            )?;
+
+            // Render delete button if more than 1 desktop
+            if desktop_bar.num_desktops > 1 {
+                let del_x = x + preview.delete_button_x;
+                let del_y = preview.y + preview.delete_button_y;
+                xconn.render_delete_button(
+                    overview,
+                    del_x,
+                    del_y,
+                    preview.delete_button_size,
+                    false,
+                )?;
+            }
+        }
+    }
+
+    // Render dragged preview following cursor (constrained to bar Y)
+    if let Some(preview) = desktop_bar
+        .preview_layouts
+        .iter()
+        .find(|p| p.desktop_index == dragged_desktop)
+    {
+        // Center the preview on cursor X
+        let drag_x = cursor_x - (PREVIEW_WIDTH / 2) as i16;
+        let drag_y = preview.y;
+
+        // Render with slight visual difference (could add shadow later)
+        let mut dragged_preview = preview.clone();
+        dragged_preview.x = drag_x;
+        dragged_preview.y = drag_y;
+        xconn.render_desktop_preview_full(
+            overview,
+            &dragged_preview,
+            captures,
+            true, // Highlight as hovered
+            0,
+        )?;
+    }
+
+    // Render plus button
+    let pb = &desktop_bar.plus_button;
+    xconn.render_plus_button(overview, pb.x, pb.y, pb.size, false)?;
 
     Ok(())
 }

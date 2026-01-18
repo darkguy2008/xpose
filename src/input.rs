@@ -18,6 +18,8 @@ pub enum InputAction {
     ActivateDesktop(u32),
     /// User clicked the plus button.
     ClickPlusButton,
+    /// User clicked the delete button on a desktop.
+    DeleteDesktop(u32),
     /// User started dragging a window.
     StartDrag(usize),
     /// Drag position updated.
@@ -28,9 +30,17 @@ pub enum InputAction {
     CancelDrag,
     /// Mouse hovering over desktop preview.
     HoverDesktop(Option<u32>),
+    /// User started dragging a desktop preview.
+    StartDesktopDrag(u32),
+    /// Desktop drag position updated.
+    DesktopDragMove(i16, i16),
+    /// Desktop dropped at new position (from_index, insert_before_index).
+    DropDesktopAt(u32, u32),
+    /// Desktop drag was cancelled.
+    CancelDesktopDrag,
 }
 
-/// Tracks the state of a drag operation.
+/// Tracks the state of a window drag operation.
 #[derive(Debug, Clone)]
 pub struct DragState {
     pub window_index: usize,
@@ -42,6 +52,17 @@ pub struct DragState {
     /// Offset from thumbnail center to click point (set when drag starts).
     pub click_offset_x: i16,
     pub click_offset_y: i16,
+}
+
+/// Tracks the state of a desktop reorder drag operation.
+#[derive(Debug, Clone)]
+pub struct DesktopDragState {
+    pub desktop_index: u32,
+    pub start_x: i16,
+    pub start_y: i16,
+    pub current_x: i16,
+    pub current_y: i16,
+    pub is_active: bool,
 }
 
 impl DragState {
@@ -83,6 +104,37 @@ impl DragState {
     }
 }
 
+impl DesktopDragState {
+    const DRAG_THRESHOLD: i16 = 5;
+
+    pub fn new(desktop_index: u32, x: i16, y: i16) -> Self {
+        Self {
+            desktop_index,
+            start_x: x,
+            start_y: y,
+            current_x: x,
+            current_y: y,
+            is_active: false,
+        }
+    }
+
+    /// Update drag position, returns true if drag became active.
+    pub fn update(&mut self, x: i16, y: i16) -> bool {
+        self.current_x = x;
+        self.current_y = y;
+
+        if !self.is_active {
+            let dx = (x - self.start_x).abs();
+            let dy = (y - self.start_y).abs();
+            if dx > Self::DRAG_THRESHOLD || dy > Self::DRAG_THRESHOLD {
+                self.is_active = true;
+                return true;
+            }
+        }
+        false
+    }
+}
+
 /// Handles mouse and keyboard input for the overview window.
 pub struct InputHandler {
     layouts: Vec<ThumbnailLayout>,
@@ -90,6 +142,7 @@ pub struct InputHandler {
     hovered_index: Option<usize>,
     hovered_desktop: Option<u32>,
     drag_state: Option<DragState>,
+    desktop_drag_state: Option<DesktopDragState>,
 }
 
 impl InputHandler {
@@ -100,6 +153,7 @@ impl InputHandler {
             hovered_index: None,
             hovered_desktop: None,
             drag_state: None,
+            desktop_drag_state: None,
         }
     }
 
@@ -131,6 +185,11 @@ impl InputHandler {
         self.drag_state.as_mut()
     }
 
+    /// Get the current desktop drag state.
+    pub fn desktop_drag_state(&self) -> Option<&DesktopDragState> {
+        self.desktop_drag_state.as_ref()
+    }
+
     /// Update the layouts used for hit-testing.
     /// Called when the grid layout is recalculated (e.g., after removing windows).
     pub fn update_layouts(&mut self, new_layouts: Vec<ThumbnailLayout>) {
@@ -155,9 +214,16 @@ impl InputHandler {
         if let Some(ref bar) = self.desktop_bar {
             if bar.contains_point(event.event_x, event.event_y) {
                 match bar.hit_test(event.event_x, event.event_y) {
+                    DesktopBarHit::DeleteButton(idx) => {
+                        log::info!("Clicked delete button for desktop {}", idx);
+                        return InputAction::DeleteDesktop(idx);
+                    }
                     DesktopBarHit::Desktop(idx) => {
-                        log::info!("Clicked desktop {}", idx);
-                        return InputAction::ActivateDesktop(idx);
+                        // Start potential desktop drag (don't activate immediately)
+                        log::debug!("Starting potential desktop drag on {}", idx);
+                        self.desktop_drag_state =
+                            Some(DesktopDragState::new(idx, event.event_x, event.event_y));
+                        return InputAction::None; // Wait to see if drag or click
                     }
                     DesktopBarHit::PlusButton => {
                         log::info!("Clicked plus button");
@@ -185,11 +251,37 @@ impl InputHandler {
 
     /// Handle a button release event.
     pub fn handle_button_release(&mut self, event: &ButtonReleaseEvent) -> InputAction {
+        // Handle desktop drag release first
+        if let Some(drag) = self.desktop_drag_state.take() {
+            if drag.is_active {
+                // Calculate insert position
+                if let Some(ref bar) = self.desktop_bar {
+                    let insert_pos = bar.calculate_insert_position(event.event_x, drag.desktop_index);
+                    // Only trigger reorder if position actually changes
+                    if insert_pos != drag.desktop_index && insert_pos != drag.desktop_index + 1 {
+                        log::info!(
+                            "Dropping desktop {} at position {}",
+                            drag.desktop_index,
+                            insert_pos
+                        );
+                        return InputAction::DropDesktopAt(drag.desktop_index, insert_pos);
+                    }
+                }
+                log::debug!("Desktop drag cancelled (no position change)");
+                return InputAction::CancelDesktopDrag;
+            } else {
+                // Was a click, not a drag - activate the desktop
+                log::info!("Activated desktop {} (click)", drag.desktop_index);
+                return InputAction::ActivateDesktop(drag.desktop_index);
+            }
+        }
+
+        // Handle window drag release
         if let Some(drag) = self.drag_state.take() {
             if drag.is_active {
                 // Check if dropping on a desktop
                 if let Some(ref bar) = self.desktop_bar {
-                    if let DesktopBarHit::Desktop(desktop_idx) =
+                    if let DesktopBarHit::Desktop(desktop_idx) | DesktopBarHit::DeleteButton(desktop_idx) =
                         bar.hit_test(event.event_x, event.event_y)
                     {
                         log::info!(
@@ -234,7 +326,18 @@ impl InputHandler {
 
     /// Handle a pointer motion event.
     pub fn handle_motion(&mut self, event: &MotionNotifyEvent) -> InputAction {
-        // Update drag state if active
+        // Update desktop drag state if active
+        if let Some(ref mut drag) = self.desktop_drag_state {
+            let became_active = drag.update(event.event_x, event.event_y);
+            if became_active {
+                return InputAction::StartDesktopDrag(drag.desktop_index);
+            }
+            if drag.is_active {
+                return InputAction::DesktopDragMove(event.event_x, event.event_y);
+            }
+        }
+
+        // Update window drag state if active
         if let Some(ref mut drag) = self.drag_state {
             let became_active = drag.update(event.event_x, event.event_y);
             if became_active {
@@ -244,7 +347,7 @@ impl InputHandler {
                 // Update hover state for desktop bar during drag
                 if let Some(ref bar) = self.desktop_bar {
                     let new_hover = match bar.hit_test(event.event_x, event.event_y) {
-                        DesktopBarHit::Desktop(idx) => Some(idx),
+                        DesktopBarHit::Desktop(idx) | DesktopBarHit::DeleteButton(idx) => Some(idx),
                         _ => None,
                     };
                     if new_hover != self.hovered_desktop {

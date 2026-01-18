@@ -245,3 +245,168 @@ pub fn restore_window_visibility(
     xconn.flush()?;
     Ok(())
 }
+
+/// Delete a specific desktop and move its windows to an adjacent desktop.
+/// - If deleting the first desktop (index 0), windows move to the new desktop 0 (was 1)
+/// - Otherwise, windows move to the previous desktop (index - 1)
+/// Returns error if only 1 desktop exists.
+pub fn delete_desktop(
+    xconn: &XConnection,
+    state: &mut DesktopState,
+    desktop_to_delete: u32,
+) -> Result<()> {
+    if state.desktops <= 1 {
+        return Err(crate::error::XposeError::Other(
+            "Cannot delete the last desktop".to_string(),
+        ));
+    }
+
+    if desktop_to_delete >= state.desktops {
+        return Err(crate::error::XposeError::Other(format!(
+            "Desktop {} does not exist",
+            desktop_to_delete
+        )));
+    }
+
+    // Determine target desktop for window migration
+    // After deletion, all indices >= deleted shift down by 1
+    // So if deleting 0, windows go to what will become 0 (currently 1)
+    // If deleting N > 0, windows go to N-1
+    let target_desktop = if desktop_to_delete == 0 { 0 } else { desktop_to_delete - 1 };
+
+    log::info!(
+        "Deleting desktop {}, moving windows to desktop {}",
+        desktop_to_delete,
+        target_desktop
+    );
+
+    // Move all windows from deleted desktop to target
+    for (_, desktop) in state.windows.iter_mut() {
+        if *desktop == desktop_to_delete {
+            *desktop = target_desktop;
+        }
+    }
+
+    // Shift all desktop assignments > deleted index down by 1
+    for (_, desktop) in state.windows.iter_mut() {
+        if *desktop > desktop_to_delete {
+            *desktop -= 1;
+        }
+    }
+
+    // Merge deleted desktop's stacking into target
+    if let Some(deleted_stacking) = state.stacking.remove(&desktop_to_delete) {
+        let target_stacking = state.stacking.entry(target_desktop).or_default();
+        target_stacking.extend(deleted_stacking);
+    }
+
+    // Shift stacking order keys
+    let old_stacking = std::mem::take(&mut state.stacking);
+    for (desk, order) in old_stacking {
+        let new_key = if desk > desktop_to_delete {
+            desk - 1
+        } else {
+            desk
+        };
+        state.stacking.insert(new_key, order);
+    }
+
+    // Update desktop count
+    state.desktops -= 1;
+
+    // Adjust current desktop if necessary
+    if state.current == desktop_to_delete {
+        state.current = target_desktop.min(state.desktops - 1);
+    } else if state.current > desktop_to_delete {
+        state.current -= 1;
+    }
+
+    state.sync_to_x(xconn)?;
+    state.save()?;
+
+    Ok(())
+}
+
+/// Reorder desktops by moving `from_desktop` to position `to_position`.
+/// `to_position` is the index the desktop will be inserted BEFORE.
+/// If `to_position >= num_desktops`, it's inserted at the end.
+/// All window assignments and stacking orders are updated accordingly.
+pub fn reorder_desktop(
+    xconn: &XConnection,
+    state: &mut DesktopState,
+    from_desktop: u32,
+    to_position: u32,
+) -> Result<()> {
+    if from_desktop >= state.desktops {
+        return Err(crate::error::XposeError::Other(format!(
+            "Invalid source desktop {}",
+            from_desktop
+        )));
+    }
+
+    // Clamp to_position to valid range
+    let to_position = to_position.min(state.desktops);
+
+    // No change needed if staying in same position
+    if from_desktop == to_position || from_desktop + 1 == to_position {
+        return Ok(());
+    }
+
+    log::info!(
+        "Reordering desktop {} to position {}",
+        from_desktop,
+        to_position
+    );
+
+    // Build mapping from old indices to new indices
+    let mut index_map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+
+    if from_desktop < to_position {
+        // Moving right: from shifts to to-1, everything between shifts left
+        for i in 0..state.desktops {
+            if i == from_desktop {
+                index_map.insert(i, to_position - 1);
+            } else if i > from_desktop && i < to_position {
+                index_map.insert(i, i - 1);
+            } else {
+                index_map.insert(i, i);
+            }
+        }
+    } else {
+        // Moving left: from shifts to to, everything between shifts right
+        for i in 0..state.desktops {
+            if i == from_desktop {
+                index_map.insert(i, to_position);
+            } else if i >= to_position && i < from_desktop {
+                index_map.insert(i, i + 1);
+            } else {
+                index_map.insert(i, i);
+            }
+        }
+    }
+
+    // Update window assignments
+    for (_, desktop) in state.windows.iter_mut() {
+        if let Some(&new_idx) = index_map.get(desktop) {
+            *desktop = new_idx;
+        }
+    }
+
+    // Update stacking orders
+    let old_stacking = std::mem::take(&mut state.stacking);
+    for (old_idx, order) in old_stacking {
+        if let Some(&new_idx) = index_map.get(&old_idx) {
+            state.stacking.insert(new_idx, order);
+        }
+    }
+
+    // Update current desktop
+    if let Some(&new_current) = index_map.get(&state.current) {
+        state.current = new_current;
+    }
+
+    state.sync_to_x(xconn)?;
+    state.save()?;
+
+    Ok(())
+}

@@ -7,11 +7,13 @@ use crate::desktop::DesktopState;
 
 // Layout constants
 pub const BAR_HEIGHT: u16 = 120;
-const PREVIEW_PADDING: u16 = 15;
-const PREVIEW_HEIGHT: u16 = 80;
-const PREVIEW_WIDTH: u16 = (PREVIEW_HEIGHT as f64 * 16.0 / 9.0) as u16; // ~142
+pub const PREVIEW_PADDING: u16 = 15;
+pub const PREVIEW_HEIGHT: u16 = 80;
+pub const PREVIEW_WIDTH: u16 = (PREVIEW_HEIGHT as f64 * 16.0 / 9.0) as u16; // ~142
 const PLUS_BUTTON_SIZE: u16 = 40;
 const PLUS_BUTTON_MARGIN: u16 = 20;
+const DELETE_BUTTON_SIZE: u16 = 16;
+const DELETE_BUTTON_MARGIN: u16 = 4;
 
 
 /// Result of hit testing the desktop bar.
@@ -19,6 +21,7 @@ const PLUS_BUTTON_MARGIN: u16 = 20;
 pub enum DesktopBarHit {
     None,
     Desktop(u32),
+    DeleteButton(u32),
     PlusButton,
 }
 
@@ -42,6 +45,10 @@ pub struct DesktopPreviewLayout {
     pub height: u16,
     pub is_current: bool,
     pub mini_windows: Vec<MiniWindowLayout>,  // Windows to render in this preview
+    // Delete button position (relative to preview origin)
+    pub delete_button_x: i16,
+    pub delete_button_y: i16,
+    pub delete_button_size: u16,
 }
 
 /// Layout for the plus button.
@@ -93,6 +100,10 @@ impl DesktopBar {
                 height: preview_height,
                 is_current: i == current_desktop,
                 mini_windows: Vec::new(),
+                // Delete button in top-right corner
+                delete_button_x: (preview_width - DELETE_BUTTON_SIZE - DELETE_BUTTON_MARGIN) as i16,
+                delete_button_y: DELETE_BUTTON_MARGIN as i16,
+                delete_button_size: DELETE_BUTTON_SIZE,
             });
         }
 
@@ -125,13 +136,25 @@ impl DesktopBar {
             return DesktopBarHit::PlusButton;
         }
 
-        // Check desktop previews
+        // Check desktop previews (delete button has priority over desktop area)
         for preview in &self.preview_layouts {
             if x >= preview.x
                 && x < preview.x + preview.width as i16
                 && y >= preview.y
                 && y < preview.y + preview.height as i16
             {
+                // Check delete button first (only if more than 1 desktop)
+                if self.num_desktops > 1 {
+                    let del_x = preview.x + preview.delete_button_x;
+                    let del_y = preview.y + preview.delete_button_y;
+                    if x >= del_x
+                        && x < del_x + preview.delete_button_size as i16
+                        && y >= del_y
+                        && y < del_y + preview.delete_button_size as i16
+                    {
+                        return DesktopBarHit::DeleteButton(preview.desktop_index);
+                    }
+                }
                 return DesktopBarHit::Desktop(preview.desktop_index);
             }
         }
@@ -145,6 +168,81 @@ impl DesktopBar {
             .iter()
             .find(|p| p.desktop_index == desktop_index)
             .map(|p| (p.x + (p.width / 2) as i16, p.y + (p.height / 2) as i16))
+    }
+
+    /// Determine where a dragged desktop would be inserted based on cursor X position.
+    /// Returns the desktop index that the dragged item would be inserted BEFORE.
+    /// Returns num_desktops if inserting at the end.
+    pub fn calculate_insert_position(&self, cursor_x: i16, dragged_desktop: u32) -> u32 {
+        for preview in &self.preview_layouts {
+            if preview.desktop_index == dragged_desktop {
+                continue; // Skip the dragged preview
+            }
+            let center_x = preview.x + (preview.width / 2) as i16;
+            if cursor_x < center_x {
+                return preview.desktop_index;
+            }
+        }
+        self.num_desktops // Insert at end
+    }
+
+    /// Calculate preview X positions with a gap for insert animation.
+    /// Returns list of (desktop_index, x_position) excluding the dragged desktop.
+    pub fn calculate_layouts_with_gap(
+        &self,
+        dragged_index: u32,
+        insert_before: u32,
+    ) -> Vec<(u32, i16)> {
+        let gap_width = (PREVIEW_WIDTH + PREVIEW_PADDING) as i16;
+        let mut result = Vec::new();
+
+        // Find the starting X of the first preview
+        let base_x = self
+            .preview_layouts
+            .first()
+            .map(|p| p.x)
+            .unwrap_or(0);
+
+        let mut x = base_x;
+        let mut passed_dragged = false;
+
+        for preview in &self.preview_layouts {
+            if preview.desktop_index == dragged_index {
+                passed_dragged = true;
+                continue; // Skip dragged
+            }
+
+            // If we haven't passed the dragged one yet, we need to check if
+            // we're at the insert position (gap should open here)
+            let _effective_index = if passed_dragged {
+                preview.desktop_index - 1
+            } else {
+                preview.desktop_index
+            };
+
+            // Insert gap before this preview if this is the insert position
+            if preview.desktop_index == insert_before
+                || (insert_before >= self.num_desktops && preview.desktop_index == self.num_desktops - 1 && preview.desktop_index != dragged_index)
+            {
+                // For end insertion, gap goes after the last non-dragged preview
+                if insert_before < self.num_desktops {
+                    x += gap_width;
+                }
+            }
+
+            result.push((preview.desktop_index, x));
+            x += (PREVIEW_WIDTH + PREVIEW_PADDING) as i16;
+
+            // Add gap at the end if inserting at the end
+            if insert_before >= self.num_desktops
+                && preview.desktop_index == self.num_desktops - 1
+                && preview.desktop_index != dragged_index
+            {
+                // Gap is implicitly at the end
+            }
+        }
+
+        result
     }
 
     /// Calculate mini-window layouts for all desktop previews.
