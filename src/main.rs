@@ -278,7 +278,7 @@ fn recalculate_filtered_layout(
         .collect()
 }
 
-use animation::{calculate_exit_layouts, calculate_start_layouts, AnimationConfig, Animator};
+use animation::{AnimatedLayout, AnimationConfig, Animator};
 use capture::CapturedWindow;
 use config::Config;
 use connection::XConnection;
@@ -290,8 +290,13 @@ use renderer::OverviewWindow;
 use state::WindowState;
 
 fn main() {
-    // Initialize logging to /tmp/xpose.log (recreated each run)
-    let log_file = std::fs::File::create("/tmp/xpose.log").expect("Failed to create log file");
+    // Initialize logging to /tmp/xpose.log (append mode)
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open("/tmp/xpose.log")
+        .expect("Failed to open log file");
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .target(env_logger::Target::Pipe(Box::new(log_file)))
@@ -304,7 +309,9 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    log::info!("Starting xpose");
+    log::info!("========================================");
+    log::info!("Starting xpose - new session");
+    log::info!("========================================");
 
     // Load configuration
     let config = Config::load();
@@ -344,11 +351,25 @@ fn run() -> Result<()> {
     let (mut windows, skipped_windows, original_stacking_order) =
         xconn.find_all_windows(&config.exclude_classes)?;
 
+    // Log existing window assignments from loaded state
+    log::info!("Loaded desktop state has {} window assignments:", desktop_state.windows.len());
+    for (key, &desktop) in &desktop_state.windows {
+        log::info!("  Window 0x{} -> desktop {}", key, desktop);
+    }
+
     // Assign any new windows to the current desktop
     // Windows that were already tracked keep their assignments
+    log::info!("Processing {} windows (current desktop = {}):", windows.len(), desktop_state.current);
     for info in &windows {
-        // This will assign to current desktop if not already tracked
-        desktop_state.get_window_desktop(info.frame_window, desktop_state.current);
+        let was_known = desktop_state.windows.contains_key(&info.frame_window.to_string());
+        let assigned = desktop_state.get_window_desktop(info.frame_window, desktop_state.current);
+        if !was_known {
+            log::info!("  NEW: {:?} (0x{:x}) -> desktop {}",
+                info.wm_name.as_deref().unwrap_or("?"), info.frame_window, assigned);
+        } else {
+            log::info!("  existing: {:?} (0x{:x}) on desktop {}",
+                info.wm_name.as_deref().unwrap_or("?"), info.frame_window, assigned);
+        }
     }
     desktop_state.save()?;
 
@@ -409,15 +430,31 @@ fn run() -> Result<()> {
         );
     }
 
-    // Calculate layout
+    // Calculate layout for windows on the current desktop only
     let config = LayoutConfig::default();
+    let current_desktop = desktop_state.current;
+    let grid_indices: Vec<usize> = captures
+        .iter()
+        .enumerate()
+        .filter(|(_, capture)| {
+            desktop_state.is_visible_on(capture.info.frame_window, current_desktop)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let grid_infos: Vec<window_finder::WindowInfo> = grid_indices
+        .iter()
+        .map(|&idx| captures[idx].info.clone())
+        .collect();
     let mut layouts = calculate_layout(
-        &captures.iter().map(|c| c.info.clone()).collect::<Vec<_>>(),
+        &grid_infos,
         xconn.screen_width,
         xconn.screen_height,
         &config,
         bar_height,
     );
+    for (layout, &capture_idx) in layouts.iter_mut().zip(grid_indices.iter()) {
+        layout.window_index = capture_idx;
+    }
 
     // Debug: print layout positions
     for (i, layout) in layouts.iter().enumerate() {
@@ -463,20 +500,27 @@ fn run() -> Result<()> {
     xconn.flush()?;
 
     // Run entrance animation
-    let windows_info: Vec<_> = captures.iter().map(|c| c.info.clone()).collect();
-    let start_layouts = calculate_start_layouts(
-        &windows_info,
-        &layouts,
-        xconn.screen_width,
-        xconn.screen_height,
-    );
+    let start_layouts: Vec<AnimatedLayout> = grid_infos
+        .iter()
+        .zip(grid_indices.iter())
+        .map(|(info, &capture_idx)| AnimatedLayout {
+            x: info.x,
+            y: info.y,
+            width: info.width,
+            height: info.height,
+            window_index: capture_idx,
+        })
+        .collect();
 
     let animator = Animator::new(start_layouts, layouts.clone(), &entrance_anim);
 
     // Build render order from original Z-order (bottom to top)
     let render_order: Vec<usize> = original_stacking_order
         .iter()
-        .filter_map(|frame| captures.iter().position(|c| c.info.frame_window == *frame))
+        .filter_map(|frame| {
+            let capture_idx = captures.iter().position(|c| c.info.frame_window == *frame)?;
+            layouts.iter().position(|l| l.window_index == capture_idx)
+        })
         .collect();
 
     // Animation loop - fade out skipped windows while animating managed windows
@@ -507,8 +551,9 @@ fn run() -> Result<()> {
         }
 
         // Render managed windows in original Z-order (bottom to top)
-        for &idx in &render_order {
-            let layout = &current[idx];
+        for &layout_idx in &render_order {
+            let layout = &current[layout_idx];
+            let idx = layout.window_index;
             xconn.render_thumbnail_animated(
                 captures[idx].picture,
                 overview.picture,
@@ -535,6 +580,7 @@ fn run() -> Result<()> {
     // Event loop
     let mut input_handler = InputHandler::new(layouts.clone(), desktop_bar.clone());
     let mut selected_window: Option<usize> = None;
+    let mut selected_desktop: Option<u32> = None;
     let mut last_hovered: Option<usize> = None;
     let mut should_exit = false;
 
@@ -545,7 +591,14 @@ fn run() -> Result<()> {
     let mut drag_animation: Option<DragAnimation> = None;
     let mut last_drag_rect: Option<(i16, i16, u16, u16)> = None;
     let mut dragging_window_index: Option<usize> = None; // Window being dragged (to hide from grid)
-    let mut removed_windows: HashSet<usize> = HashSet::new(); // Windows removed from grid (moved to desktops)
+    let mut removed_windows: HashSet<usize> = captures
+        .iter()
+        .enumerate()
+        .filter(|(_, capture)| {
+            !desktop_state.is_visible_on(capture.info.frame_window, current_desktop)
+        })
+        .map(|(i, _)| i)
+        .collect();
 
     // Grid transition animation state
     let mut grid_transition_animation: Option<GridTransitionAnimation> = None;
@@ -626,21 +679,9 @@ fn run() -> Result<()> {
                     desktop_state.sync_to_x(&xconn)?;
                     desktop_state.save()?;
 
-                    // Update desktop bar highlighting
-                    if let Some(ref mut bar) = desktop_bar {
-                        for preview in &mut bar.preview_layouts {
-                            preview.is_current = preview.desktop_index == idx;
-                        }
-                        bar.current_desktop = idx;
-                    }
-
-                    // Redraw
-                    xconn.clear_overview(&overview)?;
-                    if let Some(ref bar) = desktop_bar {
-                        render_desktop_bar(&xconn, &overview, bar, 0, input_handler.hovered_desktop(), &captures)?;
-                    }
-                    render_all_thumbnails(&xconn, &captures, &layouts, &overview, last_hovered, dragging_window_index)?;
-                    needs_present = true;
+                    // Store selected desktop for zoom animation on exit
+                    selected_desktop = Some(idx);
+                    should_exit = true;
                 }
                 InputAction::ClickPlusButton => {
                     log::info!("Adding new desktop");
@@ -672,50 +713,53 @@ fn run() -> Result<()> {
                     needs_present = true;
                 }
                 InputAction::StartDrag(index) => {
-                    log::info!("Started dragging window {}", index);
-                    dragging_window_index = Some(index);
+                    if let Some(layout) = find_layout(&layouts, index) {
+                        log::info!("Started dragging window {}", index);
+                        dragging_window_index = Some(index);
 
-                    // Calculate and store click offset, then compute drag position
-                    if let Some(drag) = input_handler.drag_state_mut() {
-                        let capture = &captures[index];
-                        let layout = &layouts[index];
+                        // Calculate and store click offset, then compute drag position
+                        if let Some(drag) = input_handler.drag_state_mut() {
+                            let capture = &captures[index];
 
-                        // Calculate offset from thumbnail center to click point
-                        let thumb_center_x = layout.x + (layout.width / 2) as i16;
-                        let thumb_center_y = layout.y + (layout.height / 2) as i16;
-                        let offset_x = drag.start_x - thumb_center_x;
-                        let offset_y = drag.start_y - thumb_center_y;
-                        drag.set_click_offset(offset_x, offset_y);
+                            // Calculate offset from thumbnail center to click point
+                            let thumb_center_x = layout.x + (layout.width / 2) as i16;
+                            let thumb_center_y = layout.y + (layout.height / 2) as i16;
+                            let offset_x = drag.start_x - thumb_center_x;
+                            let offset_y = drag.start_y - thumb_center_y;
+                            drag.set_click_offset(offset_x, offset_y);
 
-                        // Scale based on Y position relative to snap target size
-                        let (scale, _) = calculate_drag_scale_and_target(
-                            drag.current_y, drag.start_y, layout, &desktop_bar, &captures[index],
-                        );
-                        let rect = calculate_drag_rect(
-                            drag.current_x, drag.current_y,
-                            layout.width, layout.height, scale,
-                            drag.click_offset_x, drag.click_offset_y,
-                        );
-                        last_drag_rect = Some(rect);
+                            // Scale based on Y position relative to snap target size
+                            let (scale, _) = calculate_drag_scale_and_target(
+                                drag.current_y, drag.start_y, layout, &desktop_bar, &captures[index],
+                            );
+                            let rect = calculate_drag_rect(
+                                drag.current_x, drag.current_y,
+                                layout.width, layout.height, scale,
+                                drag.click_offset_x, drag.click_offset_y,
+                            );
+                            last_drag_rect = Some(rect);
 
-                        xconn.clear_overview(&overview)?;
-                        if let Some(ref bar) = desktop_bar {
-                            render_desktop_bar(&xconn, &overview, bar, 0, input_handler.hovered_desktop(), &captures)?;
+                            xconn.clear_overview(&overview)?;
+                            if let Some(ref bar) = desktop_bar {
+                                render_desktop_bar(&xconn, &overview, bar, 0, input_handler.hovered_desktop(), &captures)?;
+                            }
+                            render_all_thumbnails(&xconn, &captures, &layouts, &overview, last_hovered, dragging_window_index)?;
+                            xconn.render_dragged_window(
+                                capture.picture, overview.picture,
+                                capture.info.width, capture.info.height,
+                                rect.0, rect.1, rect.2, rect.3,
+                            )?;
                         }
-                        render_all_thumbnails(&xconn, &captures, &layouts, &overview, last_hovered, dragging_window_index)?;
-                        xconn.render_dragged_window(
-                            capture.picture, overview.picture,
-                            capture.info.width, capture.info.height,
-                            rect.0, rect.1, rect.2, rect.3,
-                        )?;
                     }
                     needs_present = true;
                 }
                 InputAction::DragMove(x, y) => {
                     // Calculate drag scale based on Y position
                     if let Some(drag) = input_handler.drag_state() {
+                        let Some(layout) = find_layout(&layouts, drag.window_index) else {
+                            continue;
+                        };
                         let capture = &captures[drag.window_index];
-                        let layout = &layouts[drag.window_index];
 
                         // Scale based on Y position relative to snap target size
                         let (scale, _) = calculate_drag_scale_and_target(
@@ -776,21 +820,22 @@ fn run() -> Result<()> {
                     if let Some(rect) = last_drag_rect {
                         // Find the window's grid layout position
                         if let Some(drag) = input_handler.drag_state() {
-                            let layout = &layouts[drag.window_index];
-                            drag_animation = Some(DragAnimation {
-                                mode: AnimationMode::RevertToGrid,
-                                window_index: drag.window_index,
-                                start_x: rect.0,
-                                start_y: rect.1,
-                                start_width: rect.2,
-                                start_height: rect.3,
-                                end_x: layout.x,
-                                end_y: layout.y,
-                                end_width: layout.width,
-                                end_height: layout.height,
-                                start_time: Instant::now(),
-                                duration_ms: REVERT_DURATION_MS,
-                            });
+                            if let Some(layout) = find_layout(&layouts, drag.window_index) {
+                                drag_animation = Some(DragAnimation {
+                                    mode: AnimationMode::RevertToGrid,
+                                    window_index: drag.window_index,
+                                    start_x: rect.0,
+                                    start_y: rect.1,
+                                    start_width: rect.2,
+                                    start_height: rect.3,
+                                    end_x: layout.x,
+                                    end_y: layout.y,
+                                    end_width: layout.width,
+                                    end_height: layout.height,
+                                    start_time: Instant::now(),
+                                    duration_ms: REVERT_DURATION_MS,
+                                });
+                            }
                         }
                     }
                     last_drag_rect = None;
@@ -864,12 +909,10 @@ fn run() -> Result<()> {
                         // Get window ID (use frame window for state tracking)
                         let window_id = captures[anim.window_index].info.frame_window;
 
-                        // Move window using integrated desktop manager
-                        // desktop_idx is 0-based in our UI, state uses 1-based
-                        let target_desktop = (desktop_idx + 1) as u32;
-                        match desktop::move_window(&xconn, &mut desktop_state, window_id, target_desktop) {
+                        // Move window using integrated desktop manager (0-indexed)
+                        match desktop::move_window(&xconn, &mut desktop_state, window_id, desktop_idx as u32) {
                             Ok(()) => {
-                                log::info!("Moved window 0x{:x} to desktop {}", window_id, target_desktop);
+                                log::info!("Moved window 0x{:x} to desktop {}", window_id, desktop_idx);
                             }
                             Err(e) => {
                                 log::warn!("Failed to move window: {}", e);
@@ -974,9 +1017,87 @@ fn run() -> Result<()> {
         }
     }
 
-    // Run exit animation - fade in skipped windows while animating managed windows back
-    {
-        let (exit_start, exit_end) = calculate_exit_layouts(&windows_info, &layouts);
+    // Run exit animation
+    if let Some(desktop_idx) = selected_desktop {
+        // Desktop zoom animation - scale the selected desktop preview to full screen
+        if let Some(ref bar) = desktop_bar {
+            if let Some(preview) = bar.preview_layouts.iter().find(|p| p.desktop_index == desktop_idx) {
+                // Log what mini_windows we're about to animate
+                log::info!("Desktop zoom animation for desktop {}", desktop_idx);
+                log::info!("Preview mini_windows ({}):", preview.mini_windows.len());
+                for (i, mini) in preview.mini_windows.iter().enumerate() {
+                    let name = captures.iter()
+                        .find(|c| c.info.frame_window == mini.window_id)
+                        .and_then(|c| c.info.wm_name.as_deref())
+                        .unwrap_or("?");
+                    log::info!("  [{}] {:?} (0x{:x})", i, name, mini.window_id);
+                }
+
+                // Log the original stacking order (filtered to this desktop)
+                log::info!("Original stacking order (windows on desktop {}):", desktop_idx);
+                for (i, &frame) in original_stacking_order.iter().enumerate() {
+                    if desktop_state.is_visible_on(frame, desktop_idx) {
+                        let name = captures.iter()
+                            .find(|c| c.info.frame_window == frame)
+                            .and_then(|c| c.info.wm_name.as_deref())
+                            .unwrap_or("?");
+                        log::info!("  [{}] {:?} (0x{:x})", i, name, frame);
+                    }
+                }
+
+                let exit_animator = Animator::new(vec![], vec![], &exit_anim);
+
+                // Start position: preview in the bar
+                let start_x = preview.x as f64;
+                let start_y = preview.y as f64;
+                let start_w = preview.width as f64;
+                let start_h = preview.height as f64;
+
+                // End position: full screen
+                let end_x = 0.0_f64;
+                let end_y = 0.0_f64;
+                let end_w = xconn.screen_width as f64;
+                let end_h = xconn.screen_height as f64;
+
+                while !exit_animator.is_complete() {
+                    let progress = exit_animator.progress();
+
+                    // Interpolate position and size
+                    let cur_x = (start_x + (end_x - start_x) * progress) as i16;
+                    let cur_y = (start_y + (end_y - start_y) * progress) as i16;
+                    let cur_w = (start_w + (end_w - start_w) * progress) as u16;
+                    let cur_h = (start_h + (end_h - start_h) * progress) as u16;
+
+                    xconn.clear_overview(&overview)?;
+                    xconn.render_desktop_preview_animated(
+                        &overview,
+                        preview,
+                        &captures,
+                        cur_x,
+                        cur_y,
+                        cur_w,
+                        cur_h,
+                    )?;
+                    xconn.present_overview(&overview)?;
+                    thread::sleep(exit_animator.frame_duration());
+                }
+            }
+        }
+    } else {
+        // Normal window exit animation - fade in skipped windows while animating managed windows back
+        let exit_start: Vec<AnimatedLayout> =
+            layouts.iter().map(AnimatedLayout::from).collect();
+        let exit_end: Vec<ThumbnailLayout> = grid_infos
+            .iter()
+            .zip(grid_indices.iter())
+            .map(|(info, &capture_idx)| ThumbnailLayout {
+                x: info.x,
+                y: info.y,
+                width: info.width,
+                height: info.height,
+                window_index: capture_idx,
+            })
+            .collect();
         let exit_animator = Animator::new(exit_start, exit_end, &exit_anim);
 
         // Build render order: original Z-order (bottom to top), with selected window last
@@ -1113,6 +1234,10 @@ fn render_all_thumbnails(
         xconn.draw_thumbnail_border(overview, layout, Some(idx) == highlighted)?;
     }
     Ok(())
+}
+
+fn find_layout(layouts: &[ThumbnailLayout], window_index: usize) -> Option<&ThumbnailLayout> {
+    layouts.iter().find(|l| l.window_index == window_index)
 }
 
 /// Redraw a single thumbnail (used for hover updates).
