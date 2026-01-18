@@ -14,6 +14,8 @@ pub struct WindowInfo {
     pub height: u16,
     pub wm_class: Option<String>,
     pub wm_name: Option<String>,
+    /// Whether the window was mapped (visible) when discovered
+    pub is_mapped: bool,
 }
 
 /// Result of examining a frame window.
@@ -122,6 +124,79 @@ impl XConnection {
         Ok((windows, skipped, original_stacking_order))
     }
 
+    /// Enumerate ALL application windows including unmapped ones (for virtual desktop support).
+    /// Returns (all_windows, skipped_windows, original_stacking_order).
+    /// Windows have is_mapped set to indicate their visibility state.
+    pub fn find_all_windows(
+        &self,
+        exclude_classes: &[String],
+    ) -> Result<(Vec<WindowInfo>, Vec<WindowInfo>, Vec<Window>)> {
+        let mut windows = Vec::new();
+        let mut skipped = Vec::new();
+        let mut original_stacking_order = Vec::new();
+
+        // Get all children of root (these are TWM frame windows)
+        let tree = self.conn.query_tree(self.root)?.reply()?;
+
+        for frame_window in tree.children {
+            match self.examine_frame_including_unmapped(frame_window) {
+                Ok(ExamineResult::Managed(info)) => {
+                    let is_excluded = info.wm_class.as_ref().map_or(false, |class| {
+                        exclude_classes.iter().any(|exc| {
+                            class.split_whitespace().any(|part| part.eq_ignore_ascii_case(exc))
+                        })
+                    });
+
+                    if is_excluded {
+                        log::debug!(
+                            "Excluding window by class: {:?} ({:?})",
+                            info.wm_name,
+                            info.wm_class
+                        );
+                        skipped.push(info);
+                    } else {
+                        log::debug!(
+                            "Found window: {:?} ({:?}) frame=0x{:x} mapped={} at {}x{}+{}+{}",
+                            info.wm_name,
+                            info.wm_class,
+                            info.frame_window,
+                            info.is_mapped,
+                            info.width,
+                            info.height,
+                            info.x,
+                            info.y
+                        );
+                        original_stacking_order.push(info.frame_window);
+                        windows.push(info);
+                    }
+                }
+                Ok(ExamineResult::Skipped(info)) => {
+                    log::debug!(
+                        "Skipped visible window: {:?} at {}x{}+{}+{}",
+                        info.wm_name,
+                        info.width,
+                        info.height,
+                        info.x,
+                        info.y
+                    );
+                    skipped.push(info);
+                }
+                Ok(ExamineResult::Ignored) => {}
+                Err(e) => {
+                    log::debug!("Error examining frame 0x{:x}: {}", frame_window, e);
+                }
+            }
+        }
+
+        log::info!(
+            "Found {} application windows (including unmapped), {} skipped",
+            windows.len(),
+            skipped.len()
+        );
+
+        Ok((windows, skipped, original_stacking_order))
+    }
+
     /// Examine a potential frame window to find the client window inside.
     /// Applies EWMH-based filtering to exclude non-application windows.
     fn examine_frame(&self, frame: Window) -> Result<ExamineResult> {
@@ -160,11 +235,59 @@ impl XConnection {
                 height: geom.height,
                 wm_class,
                 wm_name,
+                is_mapped: attrs.map_state == MapState::VIEWABLE,
             };
 
             // Apply EWMH-based filtering on the client window
             if self.should_skip_window(client)? {
                 // This is a visible window but filtered by EWMH - track it for fade effect
+                return Ok(ExamineResult::Skipped(info));
+            }
+
+            return Ok(ExamineResult::Managed(info));
+        }
+
+        Ok(ExamineResult::Ignored)
+    }
+
+    /// Examine a potential frame window including unmapped ones.
+    /// Similar to examine_frame but doesn't skip unmapped windows.
+    fn examine_frame_including_unmapped(&self, frame: Window) -> Result<ExamineResult> {
+        // Get frame attributes
+        let attrs = self.conn.get_window_attributes(frame)?.reply()?;
+
+        // Skip override-redirect windows (menus, tooltips, popups)
+        if attrs.override_redirect {
+            return Ok(ExamineResult::Ignored);
+        }
+
+        // Get frame geometry
+        let geom = self.conn.get_geometry(frame)?.reply()?;
+
+        // Skip tiny windows (1x1 placeholders used by some apps)
+        if geom.width <= 1 || geom.height <= 1 {
+            return Ok(ExamineResult::Ignored);
+        }
+
+        // Find client window with WM_STATE property
+        if let Some(client) = self.find_client_window(frame)? {
+            let wm_class = self.get_wm_class(client).ok().flatten();
+            let wm_name = self.get_wm_name(client).ok().flatten();
+
+            let info = WindowInfo {
+                client_window: client,
+                frame_window: frame,
+                x: geom.x,
+                y: geom.y,
+                width: geom.width,
+                height: geom.height,
+                wm_class,
+                wm_name,
+                is_mapped: attrs.map_state == MapState::VIEWABLE,
+            };
+
+            // Apply EWMH-based filtering on the client window
+            if self.should_skip_window(client)? {
                 return Ok(ExamineResult::Skipped(info));
             }
 

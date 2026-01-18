@@ -23,6 +23,7 @@ pub struct OverviewWindow {
     pub width: u16,
     pub height: u16,
     pub bg_picture: Option<Picture>,
+    pub font: Font,
 }
 
 impl XConnection {
@@ -149,9 +150,15 @@ impl XConnection {
             self.screen_height,
         )?;
 
+        // Open a font for text rendering
+        let font = self.generate_id()?;
+        // Use "fixed" which is always available
+        self.conn.open_font(font, b"fixed")?;
+        log::info!("Opened font: fixed");
+
         // Create graphics context
         self.conn
-            .create_gc(gc, window, &CreateGCAux::new().foreground(bg_color))?;
+            .create_gc(gc, window, &CreateGCAux::new().foreground(bg_color).font(font))?;
 
         // Create picture for the pixmap
         let picture = self.generate_id()?;
@@ -200,6 +207,7 @@ impl XConnection {
             width: self.screen_width,
             height: self.screen_height,
             bg_picture,
+            font,
         })
     }
 
@@ -299,6 +307,97 @@ impl XConnection {
                 width: w,
                 height: h,
             }],
+        )?;
+
+        Ok(())
+    }
+
+    /// Draw window title label centered on thumbnail.
+    pub fn draw_title_label(
+        &self,
+        overview: &OverviewWindow,
+        layout: &ThumbnailLayout,
+        title: &str,
+    ) -> Result<()> {
+        // Truncate title if too long
+        let max_chars = 50;
+        let display_title = if title.len() > max_chars {
+            format!("{}...", &title[..max_chars - 3])
+        } else {
+            title.to_string()
+        };
+
+        // "fixed" font is 6x13 pixels per character
+        let text_bytes = display_title.as_bytes();
+        let char_width: u16 = 6;
+        let text_width = (text_bytes.len() as u16) * char_width;
+        let text_height: u16 = 13;
+        let text_ascent: u16 = 11; // Baseline offset from top
+
+        let padding_h: u16 = 16;
+        let padding_v: u16 = 8;
+
+        // Calculate label dimensions
+        let label_width = text_width + padding_h * 2;
+        let label_height = text_height + padding_v * 2;
+
+        // Center label on thumbnail
+        let label_x = layout.x + (layout.width as i16 - label_width as i16) / 2;
+        let label_y = layout.y + (layout.height as i16 - label_height as i16) / 2;
+
+        // Draw semi-transparent background rectangle
+        let bg_color = 0x22_22_22; // Dark gray
+        self.conn.change_gc(
+            overview.gc,
+            &ChangeGCAux::new().foreground(bg_color),
+        )?;
+        self.conn.poly_fill_rectangle(
+            overview.pixmap,
+            overview.gc,
+            &[Rectangle {
+                x: label_x,
+                y: label_y,
+                width: label_width,
+                height: label_height,
+            }],
+        )?;
+
+        // Draw border around label
+        let border_color = 0x88_88_88;
+        self.conn.change_gc(
+            overview.gc,
+            &ChangeGCAux::new().foreground(border_color).line_width(1),
+        )?;
+        self.conn.poly_rectangle(
+            overview.pixmap,
+            overview.gc,
+            &[Rectangle {
+                x: label_x,
+                y: label_y,
+                width: label_width,
+                height: label_height,
+            }],
+        )?;
+
+        // Draw text centered in the label
+        let text_color = 0xFF_FF_FF; // White
+        self.conn.change_gc(
+            overview.gc,
+            &ChangeGCAux::new().foreground(text_color).font(overview.font),
+        )?;
+
+        // Center text horizontally and vertically
+        // X: label_x + padding
+        // Y: baseline = label_y + padding_v + text_ascent
+        let text_x = label_x + padding_h as i16;
+        let text_y = label_y + padding_v as i16 + text_ascent as i16;
+
+        self.conn.image_text8(
+            overview.pixmap,
+            overview.gc,
+            text_x,
+            text_y,
+            text_bytes,
         )?;
 
         Ok(())

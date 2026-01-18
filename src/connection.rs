@@ -1,5 +1,6 @@
 use x11rb::atom_manager;
 use x11rb::connection::Connection;
+use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 use x11rb::protocol::composite;
 use x11rb::protocol::damage;
 use x11rb::protocol::render::{self, Pictformat};
@@ -40,9 +41,9 @@ atom_manager! {
         // Root window background pixmap atoms
         _XROOTPMAP_ID,
         ESETROOT_PMAP_ID,
-        // xdeskie virtual desktop atoms
-        _XDESKIE_NUM_DESKTOPS,
-        _XDESKIE_CURRENT_DESKTOP,
+        // xpose virtual desktop atoms
+        _XPOSE_NUM_DESKTOPS,
+        _XPOSE_CURRENT_DESKTOP,
     }
 }
 
@@ -138,14 +139,14 @@ impl XConnection {
         Ok(self.conn.generate_id()?)
     }
 
-    /// Get the number of virtual desktops from xdeskie.
+    /// Get the number of virtual desktops.
     pub fn get_num_desktops(&self) -> Result<Option<u32>> {
         let reply = self
             .conn
             .get_property(
                 false,
                 self.root,
-                self.atoms._XDESKIE_NUM_DESKTOPS,
+                self.atoms._XPOSE_NUM_DESKTOPS,
                 AtomEnum::CARDINAL,
                 0,
                 1,
@@ -155,14 +156,14 @@ impl XConnection {
         Ok(reply.value32().and_then(|mut v| v.next()))
     }
 
-    /// Get the current active desktop from xdeskie.
+    /// Get the current active desktop.
     pub fn get_current_desktop(&self) -> Result<Option<u32>> {
         let reply = self
             .conn
             .get_property(
                 false,
                 self.root,
-                self.atoms._XDESKIE_CURRENT_DESKTOP,
+                self.atoms._XPOSE_CURRENT_DESKTOP,
                 AtomEnum::CARDINAL,
                 0,
                 1,
@@ -170,5 +171,70 @@ impl XConnection {
             .reply()?;
 
         Ok(reply.value32().and_then(|mut v| v.next()))
+    }
+
+    /// Set the number of virtual desktops.
+    pub fn set_num_desktops(&self, count: u32) -> Result<()> {
+        self.conn.change_property32(
+            PropMode::REPLACE,
+            self.root,
+            self.atoms._XPOSE_NUM_DESKTOPS,
+            AtomEnum::CARDINAL,
+            &[count],
+        )?;
+        Ok(())
+    }
+
+    /// Set the current active desktop.
+    pub fn set_current_desktop(&self, desktop: u32) -> Result<()> {
+        self.conn.change_property32(
+            PropMode::REPLACE,
+            self.root,
+            self.atoms._XPOSE_CURRENT_DESKTOP,
+            AtomEnum::CARDINAL,
+            &[desktop],
+        )?;
+        Ok(())
+    }
+
+    /// Map a window (make it visible).
+    pub fn map_window(&self, window: Window) -> Result<()> {
+        self.conn.map_window(window)?;
+        Ok(())
+    }
+
+    /// Unmap a window (hide it).
+    pub fn unmap_window(&self, window: Window) -> Result<()> {
+        self.conn.unmap_window(window)?;
+        Ok(())
+    }
+
+    /// Get stacking order of all toplevel windows (bottom to top).
+    pub fn get_stacking_order(&self) -> Result<Vec<Window>> {
+        let tree = self.conn.query_tree(self.root)?.reply()?;
+        Ok(tree.children)
+    }
+
+    /// Restack windows to match the given order (bottom to top).
+    pub fn restack_windows(&self, order: &[Window]) -> Result<()> {
+        // Raise each window in order, putting them above the previous one
+        for (i, &window) in order.iter().enumerate() {
+            if i == 0 {
+                // First window: lower to bottom
+                self.conn.configure_window(
+                    window,
+                    &ConfigureWindowAux::new().stack_mode(StackMode::BELOW),
+                )?;
+            } else {
+                // Subsequent windows: raise above previous
+                self.conn.configure_window(
+                    window,
+                    &ConfigureWindowAux::new()
+                        .sibling(order[i - 1])
+                        .stack_mode(StackMode::ABOVE),
+                )?;
+            }
+        }
+        Ok(())
     }
 }

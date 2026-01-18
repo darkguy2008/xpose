@@ -2,6 +2,7 @@ mod animation;
 mod capture;
 mod config;
 mod connection;
+mod desktop;
 mod desktop_bar;
 mod error;
 mod input;
@@ -9,7 +10,6 @@ mod layout;
 mod renderer;
 mod state;
 mod window_finder;
-mod xdeskie;
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -319,23 +319,42 @@ fn run() -> Result<()> {
         xconn.screen_height
     );
 
-    // Initialize desktop bar (if xdeskie is running)
-    let mut desktop_bar = match (xconn.get_num_desktops()?, xconn.get_current_desktop()?) {
-        (Some(num), Some(current)) if num > 0 => {
-            log::info!("Desktop bar enabled: {} desktops, current={}", num, current);
-            Some(DesktopBar::new(num, current, xconn.screen_width))
-        }
-        _ => {
-            log::info!("Desktop bar disabled: xdeskie not running");
-            None
-        }
-    };
-    let bar_height = desktop_bar.as_ref().map_or(0, |_| BAR_HEIGHT);
+    // Load desktop state (always enabled now)
+    let mut desktop_state = desktop::DesktopState::load()?;
 
-    // Find all windows (managed and skipped)
+    // Sync from X properties if they exist (for compatibility)
+    desktop_state.sync_from_x(&xconn)?;
+
+    log::info!(
+        "Desktop state: {} desktops, current={}",
+        desktop_state.desktops,
+        desktop_state.current
+    );
+
+    // Initialize desktop bar
+    let mut desktop_bar = Some(DesktopBar::new(
+        desktop_state.desktops,
+        desktop_state.current,
+        xconn.screen_width,
+    ));
+    let bar_height = BAR_HEIGHT;
+
+    // Find ALL windows including unmapped ones (for virtual desktop support)
     // original_stacking_order contains frame window IDs in their X11 stacking order (bottom-to-top)
     let (mut windows, skipped_windows, original_stacking_order) =
-        xconn.find_windows(&config.exclude_classes)?;
+        xconn.find_all_windows(&config.exclude_classes)?;
+
+    // Assign any new windows to the current desktop
+    // Windows that were already tracked keep their assignments
+    for info in &windows {
+        // This will assign to current desktop if not already tracked
+        desktop_state.get_window_desktop(info.frame_window, desktop_state.current);
+    }
+    desktop_state.save()?;
+
+    // Map all windows so we can capture them (they will be unmapped on exit as needed)
+    desktop::map_all_windows(&xconn, &windows)?;
+    log::info!("Mapped all {} windows for live capture", windows.len());
 
     if windows.is_empty() {
         log::info!("No windows to display");
@@ -380,14 +399,11 @@ fn run() -> Result<()> {
         }
     }
 
-    // Load xdeskie state for window-to-desktop mappings
-    let xdeskie_state = xdeskie::XdeskieState::load();
-
-    // Calculate mini-layouts for desktop previews if xdeskie is running
-    if let (Some(ref mut bar), Some(ref state)) = (&mut desktop_bar, &xdeskie_state) {
+    // Calculate mini-layouts for desktop previews using desktop state
+    if let Some(ref mut bar) = desktop_bar {
         bar.calculate_mini_layouts(
             &captures,
-            state,
+            &desktop_state,
             xconn.screen_width,
             xconn.screen_height,
         );
@@ -604,12 +620,56 @@ fn run() -> Result<()> {
                     }
                 }
                 InputAction::ActivateDesktop(idx) => {
-                    log::info!("Activate desktop {} (UI only)", idx);
-                    // TODO: Actually switch desktop when xdeskie integration is done
+                    log::info!("Switching to desktop {}", idx);
+                    // Update state (windows stay mapped while xpose is active for live capture)
+                    desktop_state.current = idx;
+                    desktop_state.sync_to_x(&xconn)?;
+                    desktop_state.save()?;
+
+                    // Update desktop bar highlighting
+                    if let Some(ref mut bar) = desktop_bar {
+                        for preview in &mut bar.preview_layouts {
+                            preview.is_current = preview.desktop_index == idx;
+                        }
+                        bar.current_desktop = idx;
+                    }
+
+                    // Redraw
+                    xconn.clear_overview(&overview)?;
+                    if let Some(ref bar) = desktop_bar {
+                        render_desktop_bar(&xconn, &overview, bar, 0, input_handler.hovered_desktop(), &captures)?;
+                    }
+                    render_all_thumbnails(&xconn, &captures, &layouts, &overview, last_hovered, dragging_window_index)?;
+                    needs_present = true;
                 }
                 InputAction::ClickPlusButton => {
-                    log::info!("Plus button clicked (UI only)");
-                    // TODO: Add new desktop when xdeskie integration is done
+                    log::info!("Adding new desktop");
+                    let new_count = desktop_state.desktops + 1;
+                    desktop::set_desktop_count(&xconn, &mut desktop_state, &windows, new_count)?;
+
+                    // Recreate desktop bar with new desktop count
+                    desktop_bar = Some(DesktopBar::new(
+                        desktop_state.desktops,
+                        desktop_state.current,
+                        xconn.screen_width,
+                    ));
+                    if let Some(ref mut bar) = desktop_bar {
+                        bar.calculate_mini_layouts(
+                            &captures,
+                            &desktop_state,
+                            xconn.screen_width,
+                            xconn.screen_height,
+                        );
+                    }
+                    input_handler.update_desktop_bar(desktop_bar.clone());
+
+                    // Redraw
+                    xconn.clear_overview(&overview)?;
+                    if let Some(ref bar) = desktop_bar {
+                        render_desktop_bar(&xconn, &overview, bar, 0, input_handler.hovered_desktop(), &captures)?;
+                    }
+                    render_all_thumbnails(&xconn, &captures, &layouts, &overview, last_hovered, dragging_window_index)?;
+                    needs_present = true;
                 }
                 InputAction::StartDrag(index) => {
                     log::info!("Started dragging window {}", index);
@@ -801,38 +861,29 @@ fn run() -> Result<()> {
             if anim.is_complete() {
                 match anim.mode {
                     AnimationMode::SnapToDesktop { desktop_idx } => {
-                        // Get window ID for xdeskie (use client window)
-                        let window_id = captures[anim.window_index].info.client_window;
+                        // Get window ID (use frame window for state tracking)
+                        let window_id = captures[anim.window_index].info.frame_window;
 
-                        // Call xdeskie to actually move the window
-                        // desktop_idx is 0-based in our UI, xdeskie uses 1-based
-                        let xdeskie_desktop = desktop_idx + 1;
-                        let result = std::process::Command::new("xdeskie")
-                            .args(["move", &format!("0x{:x}", window_id), &xdeskie_desktop.to_string()])
-                            .output();
-
-                        match result {
-                            Ok(output) if output.status.success() => {
-                                log::info!("Moved window 0x{:x} to desktop {}", window_id, xdeskie_desktop);
-                            }
-                            Ok(output) => {
-                                log::warn!("xdeskie move failed: {}", String::from_utf8_lossy(&output.stderr));
+                        // Move window using integrated desktop manager
+                        // desktop_idx is 0-based in our UI, state uses 1-based
+                        let target_desktop = (desktop_idx + 1) as u32;
+                        match desktop::move_window(&xconn, &mut desktop_state, window_id, target_desktop) {
+                            Ok(()) => {
+                                log::info!("Moved window 0x{:x} to desktop {}", window_id, target_desktop);
                             }
                             Err(e) => {
-                                log::warn!("Failed to run xdeskie: {}", e);
+                                log::warn!("Failed to move window: {}", e);
                             }
                         }
 
-                        // Reload xdeskie state and recalculate mini-layouts for desktop previews
+                        // Recalculate mini-layouts for desktop previews
                         if let Some(ref mut bar) = desktop_bar {
-                            if let Some(state) = xdeskie::XdeskieState::load() {
-                                bar.calculate_mini_layouts(
-                                    &captures,
-                                    &state,
-                                    xconn.screen_width,
-                                    xconn.screen_height,
-                                );
-                            }
+                            bar.calculate_mini_layouts(
+                                &captures,
+                                &desktop_state,
+                                xconn.screen_width,
+                                xconn.screen_height,
+                            );
                         }
 
                         // Window was dropped on desktop - remove it from grid
@@ -987,6 +1038,10 @@ fn run() -> Result<()> {
     // Cleanup
     log::debug!("Cleaning up");
 
+    // Restore window visibility based on current desktop (unmap windows on other desktops)
+    desktop::restore_window_visibility(&xconn, &desktop_state, &windows)?;
+    log::info!("Restored window visibility for desktop {}", desktop_state.current);
+
     // Restore original window stacking order before raising selected window
     xconn.restore_stacking_order(&original_stacking_order)?;
 
@@ -1096,6 +1151,12 @@ fn redraw_thumbnail(
 
     // Draw border with highlight state
     xconn.draw_thumbnail_border(overview, layout, highlighted)?;
+
+    // Draw title label when highlighted
+    if highlighted {
+        let title = capture.info.wm_name.as_deref().unwrap_or("(untitled)");
+        xconn.draw_title_label(overview, layout, title)?;
+    }
 
     Ok(())
 }

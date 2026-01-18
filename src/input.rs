@@ -130,6 +130,17 @@ impl InputHandler {
         self.drag_state.as_mut()
     }
 
+    /// Update the layouts used for hit-testing.
+    /// Called when the grid layout is recalculated (e.g., after removing windows).
+    pub fn update_layouts(&mut self, new_layouts: Vec<ThumbnailLayout>) {
+        self.layouts = new_layouts;
+    }
+
+    /// Update the desktop bar (e.g., after adding a new desktop).
+    pub fn update_desktop_bar(&mut self, new_bar: Option<DesktopBar>) {
+        self.desktop_bar = new_bar;
+    }
+
     /// Handle a button press event.
     pub fn handle_button_press(&mut self, event: &ButtonPressEvent) -> InputAction {
         log::debug!("Button press at ({}, {})", event.event_x, event.event_y);

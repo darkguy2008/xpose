@@ -15,6 +15,12 @@ pub enum XposeError {
     #[error("X11 connection error: {0}")]
     ConnectionError(#[from] x11rb::errors::ConnectionError),
 
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+
     #[error("No windows found to display")]
     NoWindows,
 
@@ -29,6 +35,9 @@ pub enum XposeError {
 
     #[error("Damage extension not available")]
     NoDamage,
+
+    #[error("{0}")]
+    Other(String),
 }
 
 pub type Result<T> = std::result::Result<T, XposeError>;

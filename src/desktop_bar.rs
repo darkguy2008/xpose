@@ -3,7 +3,7 @@
 use x11rb::protocol::xproto::Window;
 
 use crate::capture::CapturedWindow;
-use crate::xdeskie::XdeskieState;
+use crate::desktop::DesktopState;
 
 // Layout constants
 pub const BAR_HEIGHT: u16 = 120;
@@ -146,12 +146,12 @@ impl DesktopBar {
     }
 
     /// Calculate mini-window layouts for all desktop previews.
-    /// Takes window captures and xdeskie state to determine which windows
+    /// Takes window captures and desktop state to determine which windows
     /// appear on which desktop, and calculates their scaled positions.
     pub fn calculate_mini_layouts(
         &mut self,
         captures: &[CapturedWindow],
-        xdeskie_state: &XdeskieState,
+        desktop_state: &DesktopState,
         screen_width: u16,
         screen_height: u16,
     ) {
@@ -168,11 +168,11 @@ impl DesktopBar {
         for preview in &mut self.preview_layouts {
             preview.mini_windows.clear();
 
-            // Desktop indices in our UI are 0-based, but xdeskie uses 1-based
-            let xdeskie_desktop = preview.desktop_index + 1;
+            // Desktop indices in our UI are 0-based, but state uses 1-based for desktop assignment
+            let state_desktop = preview.desktop_index + 1;
 
             // Get window IDs for this desktop (including sticky windows)
-            let window_ids = xdeskie_state.windows_on_desktop(xdeskie_desktop);
+            let window_ids = desktop_state.windows_on_desktop(state_desktop);
 
             for window_id in window_ids {
                 // Find the capture for this window (try both client and frame)
