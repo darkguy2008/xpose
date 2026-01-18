@@ -18,11 +18,12 @@ pub struct CapturedWindow {
 
 impl XConnection {
     /// Capture window contents to a pixmap using XComposite.
+    /// Returns immediately - no retries. Use retry_capture for failed windows.
     pub fn capture_window(&self, info: &WindowInfo) -> Result<CapturedWindow> {
         // Redirect window to off-screen storage
         composite::redirect_window(&self.conn, info.frame_window, composite::Redirect::AUTOMATIC)?;
 
-        // Get pixmap with window contents
+        // Try to get pixmap with window contents (single attempt)
         let pixmap = self.generate_id()?;
         composite::name_window_pixmap(&self.conn, info.frame_window, pixmap)?;
 
@@ -118,5 +119,135 @@ impl XConnection {
         capture.picture = picture;
 
         Ok(())
+    }
+
+    /// Create a placeholder capture for a window that failed to capture.
+    /// Uses a solid black picture. Can be upgraded later via try_upgrade_placeholder.
+    pub fn create_placeholder_capture(&self, info: &WindowInfo) -> Result<CapturedWindow> {
+        // Redirect window (needed for later retry)
+        let _ = composite::redirect_window(&self.conn, info.frame_window, composite::Redirect::AUTOMATIC);
+
+        // Create a small pixmap filled with black as placeholder
+        let pixmap = self.generate_id()?;
+        self.conn.create_pixmap(
+            self.root_depth,
+            pixmap,
+            self.root,
+            info.width.max(1),
+            info.height.max(1),
+        )?;
+
+        // Fill with black
+        let gc = self.generate_id()?;
+        self.conn.create_gc(
+            gc,
+            pixmap,
+            &x11rb::protocol::xproto::CreateGCAux::new().foreground(0x222222),
+        )?;
+        self.conn.poly_fill_rectangle(
+            pixmap,
+            gc,
+            &[x11rb::protocol::xproto::Rectangle {
+                x: 0,
+                y: 0,
+                width: info.width.max(1),
+                height: info.height.max(1),
+            }],
+        )?;
+        self.conn.free_gc(gc)?;
+
+        // Create picture from placeholder pixmap
+        let picture = self.generate_id()?;
+        render::create_picture(
+            &self.conn,
+            picture,
+            pixmap,
+            self.pict_format_rgb,
+            &render::CreatePictureAux::new(),
+        )?;
+
+        // Create damage tracking (even for placeholder)
+        let damage_id = self.generate_id()?;
+        damage::create(&self.conn, damage_id, info.frame_window, ReportLevel::NON_EMPTY)?;
+
+        self.conn.flush()?;
+
+        log::debug!(
+            "Created placeholder for {:?} ({}x{})",
+            info.wm_name,
+            info.width,
+            info.height
+        );
+
+        Ok(CapturedWindow {
+            info: info.clone(),
+            pixmap,
+            picture,
+            damage: damage_id,
+        })
+    }
+
+    /// Try to upgrade a placeholder capture to a real capture.
+    /// Returns true if successful, false if window still not ready.
+    pub fn try_upgrade_placeholder(&self, capture: &mut CapturedWindow) -> bool {
+        // Try to get actual window pixmap
+        let new_pixmap = match self.generate_id() {
+            Ok(id) => id,
+            Err(_) => return false,
+        };
+
+        if composite::name_window_pixmap(&self.conn, capture.info.frame_window, new_pixmap).is_err() {
+            return false;
+        }
+
+        // Check if pixmap is valid
+        match self.conn.get_geometry(new_pixmap) {
+            Ok(cookie) => match cookie.reply() {
+                Ok(geom) => {
+                    // Success! Create new picture and replace placeholder
+                    let new_picture = match self.generate_id() {
+                        Ok(id) => id,
+                        Err(_) => {
+                            let _ = self.conn.free_pixmap(new_pixmap);
+                            return false;
+                        }
+                    };
+
+                    if render::create_picture(
+                        &self.conn,
+                        new_picture,
+                        new_pixmap,
+                        self.pict_format_rgb,
+                        &render::CreatePictureAux::new(),
+                    ).is_err() {
+                        let _ = self.conn.free_pixmap(new_pixmap);
+                        return false;
+                    }
+
+                    // Free old placeholder resources
+                    let _ = render::free_picture(&self.conn, capture.picture);
+                    let _ = self.conn.free_pixmap(capture.pixmap);
+
+                    // Update capture with real content
+                    capture.pixmap = new_pixmap;
+                    capture.picture = new_picture;
+                    capture.info.width = geom.width;
+                    capture.info.height = geom.height;
+
+                    let _ = self.conn.flush();
+
+                    log::info!("Upgraded placeholder to real capture: {:?}", capture.info.wm_name);
+                    true
+                }
+                Err(_) => {
+                    let _ = self.conn.free_pixmap(new_pixmap);
+                    false
+                }
+            },
+            Err(_) => {
+                let _ = self.conn.free_pixmap(new_pixmap);
+                false
+            }
+        }
     }
 }

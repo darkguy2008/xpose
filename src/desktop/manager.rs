@@ -111,6 +111,7 @@ fn restore_stacking_order(xconn: &XConnection, state: &DesktopState, desktop: u3
 }
 
 /// Switch to the next desktop (wraps around).
+#[allow(dead_code)]
 pub fn switch_next(xconn: &XConnection, state: &mut DesktopState, windows: &[WindowInfo]) -> Result<u32> {
     let next = (state.current + 1) % state.desktops;
     switch_to_desktop(xconn, state, windows, next)?;
@@ -118,6 +119,7 @@ pub fn switch_next(xconn: &XConnection, state: &mut DesktopState, windows: &[Win
 }
 
 /// Switch to the previous desktop (wraps around).
+#[allow(dead_code)]
 pub fn switch_prev(xconn: &XConnection, state: &mut DesktopState, windows: &[WindowInfo]) -> Result<u32> {
     let prev = if state.current == 0 {
         state.desktops - 1
@@ -216,7 +218,8 @@ pub fn set_desktop_count(
 }
 
 /// Map all windows (used when xpose starts to enable live capture).
-pub fn map_all_windows(xconn: &XConnection, windows: &[WindowInfo]) -> Result<()> {
+/// Returns true if any window was newly mapped.
+pub fn map_all_windows(xconn: &XConnection, windows: &[WindowInfo]) -> Result<bool> {
     let mut mapped_any = false;
     for info in windows {
         if !info.is_mapped {
@@ -225,14 +228,7 @@ pub fn map_all_windows(xconn: &XConnection, windows: &[WindowInfo]) -> Result<()
         }
     }
     xconn.flush()?;
-    // Give X server time to process all maps and make windows ready for capture
-    xconn.sync()?;
-    if mapped_any {
-        // Extra delay for windows that were unmapped - they need time to redraw
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        xconn.sync()?;
-    }
-    Ok(())
+    Ok(mapped_any)
 }
 
 /// Restore window visibility based on current desktop (used when xpose exits).

@@ -35,6 +35,7 @@ impl XConnection {
     /// original_stacking_order contains the frame window IDs of managed windows in their
     /// original X11 stacking order (bottom-to-top), used to restore Z-order on exit.
     /// `exclude_classes` is a list of WM_CLASS values to exclude from the exposé view.
+    #[allow(dead_code)]
     pub fn find_windows(
         &self,
         exclude_classes: &[String],
@@ -199,6 +200,7 @@ impl XConnection {
 
     /// Examine a potential frame window to find the client window inside.
     /// Applies EWMH-based filtering to exclude non-application windows.
+    #[allow(dead_code)]
     fn examine_frame(&self, frame: Window) -> Result<ExamineResult> {
         // Get frame attributes
         let attrs = self.conn.get_window_attributes(frame)?.reply()?;
@@ -271,6 +273,11 @@ impl XConnection {
 
         // Find client window with WM_STATE property
         if let Some(client) = self.find_client_window(frame)? {
+            // Skip windows in Withdrawn state (dead/closed windows not yet destroyed)
+            if self.is_withdrawn(client) {
+                log::debug!("Skipping withdrawn window: frame=0x{:x}", frame);
+                return Ok(ExamineResult::Ignored);
+            }
             let wm_class = self.get_wm_class(client).ok().flatten();
             let wm_name = self.get_wm_name(client).ok().flatten();
 
@@ -331,6 +338,36 @@ impl XConnection {
             .reply()?;
 
         Ok(reply.type_ != u32::from(AtomEnum::NONE))
+    }
+
+    /// Check if window is in Withdrawn state (should be ignored).
+    /// WM_STATE values: WithdrawnState=0, NormalState=1, IconicState=3
+    fn is_withdrawn(&self, window: Window) -> bool {
+        let reply = match self.conn.get_property(
+            false,
+            window,
+            self.atoms.WM_STATE,
+            self.atoms.WM_STATE,
+            0,
+            2, // WM_STATE is 2 32-bit values: state, icon_window
+        ) {
+            Ok(cookie) => match cookie.reply() {
+                Ok(r) => r,
+                Err(_) => return false,
+            },
+            Err(_) => return false,
+        };
+
+        if reply.value_len == 0 {
+            return false;
+        }
+
+        // First value is the state
+        if let Some(state) = reply.value32().and_then(|mut v| v.next()) {
+            // WithdrawnState = 0
+            return state == 0;
+        }
+        false
     }
 
     /// Get WM_CLASS property (instance and class names).

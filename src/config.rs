@@ -5,6 +5,7 @@ use std::time::Duration;
 pub struct Config {
     pub entrance_ms: u64,
     pub exit_ms: u64,
+    pub animation_speed: f64,
     /// WM_CLASS values to exclude from the exposé view
     pub exclude_classes: Vec<String>,
 }
@@ -14,6 +15,7 @@ impl Default for Config {
         Self {
             entrance_ms: 350,
             exit_ms: 350,
+            animation_speed: 1.0,
             exclude_classes: Vec::new(),
         }
     }
@@ -65,6 +67,14 @@ impl Config {
                     if let Ok(ms) = value.parse::<u64>() {
                         config.exit_ms = ms;
                         log::debug!("Config: ExitMs = {}", ms);
+                    }
+                }
+                "AnimationSpeed" => {
+                    if let Ok(speed) = value.parse::<f64>() {
+                        if speed > 0.0 {
+                            config.animation_speed = speed;
+                            log::debug!("Config: AnimationSpeed = {}", speed);
+                        }
                     }
                 }
                 "ExcludeClass" => {

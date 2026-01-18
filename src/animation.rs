@@ -48,6 +48,7 @@ impl From<&ThumbnailLayout> for AnimatedLayout {
 
 /// Calculate starting layouts based on original window positions.
 /// Windows start at their actual screen position and size.
+#[allow(dead_code)]
 pub fn calculate_start_layouts(
     windows: &[WindowInfo],
     end_layouts: &[ThumbnailLayout],
@@ -73,6 +74,7 @@ pub fn calculate_start_layouts(
 
 /// Calculate layouts for exit animation (reverse of entrance).
 /// Start at grid positions, end at original window positions.
+#[allow(dead_code)]
 pub fn calculate_exit_layouts(
     windows: &[WindowInfo],
     grid_layouts: &[ThumbnailLayout],

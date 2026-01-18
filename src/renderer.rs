@@ -197,6 +197,13 @@ impl XConnection {
             )?;
         }
 
+        // Set the pixmap as the window's background so it shows immediately when mapped
+        // (instead of flashing the background_pixel color first)
+        self.conn.change_window_attributes(
+            window,
+            &ChangeWindowAttributesAux::new().background_pixmap(pixmap),
+        )?;
+
         self.conn.flush()?;
 
         Ok(OverviewWindow {
@@ -641,6 +648,11 @@ impl XConnection {
 
     /// Copy rendered content to window.
     pub fn present_overview(&self, overview: &OverviewWindow) -> Result<()> {
+        // Keep overview above all other windows while visible.
+        self.conn.configure_window(
+            overview.window,
+            &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+        )?;
         self.conn.copy_area(
             overview.pixmap,
             overview.window,
@@ -695,6 +707,7 @@ impl XConnection {
     }
 
     /// Render a desktop preview rectangle (simple version, no window content).
+    #[allow(dead_code)]
     pub fn render_desktop_preview(
         &self,
         overview: &OverviewWindow,

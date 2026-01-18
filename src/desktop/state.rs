@@ -136,6 +136,7 @@ impl DesktopState {
     }
 
     /// Check if window is hidden by the application.
+    #[allow(dead_code)]
     pub fn is_app_hidden(&self, window_id: Window) -> bool {
         self.app_hidden.contains(&window_id.to_string())
     }

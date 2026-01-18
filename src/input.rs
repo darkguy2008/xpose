@@ -116,6 +116,7 @@ impl InputHandler {
     }
 
     /// Check if a drag is currently active.
+    #[allow(dead_code)]
     pub fn is_dragging(&self) -> bool {
         self.drag_state.as_ref().map_or(false, |d| d.is_active)
     }

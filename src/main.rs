@@ -315,8 +315,16 @@ fn run() -> Result<()> {
 
     // Load configuration
     let config = Config::load();
-    let entrance_anim = AnimationConfig::new(config.entrance_duration());
-    let exit_anim = AnimationConfig::new(config.exit_duration());
+    let animation_speed = if config.animation_speed > 0.0 {
+        config.animation_speed
+    } else {
+        1.0
+    };
+    let entrance_anim = AnimationConfig::new(scale_duration(config.entrance_duration(), animation_speed));
+    let exit_anim = AnimationConfig::new(scale_duration(config.exit_duration(), animation_speed));
+    let snap_duration_ms = scale_duration_ms(SNAP_DURATION_MS, animation_speed);
+    let revert_duration_ms = scale_duration_ms(REVERT_DURATION_MS, animation_speed);
+    let grid_transition_duration_ms = scale_duration_ms(GRID_TRANSITION_DURATION_MS, animation_speed);
 
     // Connect to X server
     let xconn = XConnection::new()?;
@@ -373,15 +381,62 @@ fn run() -> Result<()> {
     }
     desktop_state.save()?;
 
-    // Map all windows so we can capture them (they will be unmapped on exit as needed)
-    desktop::map_all_windows(&xconn, &windows)?;
-    log::info!("Mapped all {} windows for live capture", windows.len());
-
     if windows.is_empty() {
         log::info!("No windows to display");
         return Ok(());
     }
 
+    let current_desktop = desktop_state.current;
+    let current_window_ids: HashSet<Window> = desktop_state
+        .windows_on_desktop(current_desktop)
+        .into_iter()
+        .collect();
+
+    // Create the overview window (but don't map it yet - wait until captures are complete)
+    let overview = xconn.create_overview_window()?;
+
+    // Grab the X server while restacking and mapping to avoid intermediate paints.
+    xconn.conn.grab_server()?;
+
+    // Move windows from OTHER desktops off-screen BEFORE mapping to prevent flicker.
+    // When these windows get mapped, they'll be invisible because they're off-screen.
+    let offscreen_x = -(xconn.screen_width as i32 * 2);
+    for info in &windows {
+        if !current_window_ids.contains(&info.frame_window) {
+            xconn.conn.configure_window(
+                info.frame_window,
+                &ConfigureWindowAux::new().x(offscreen_x),
+            )?;
+        }
+    }
+
+    // Keep all windows below the overview to avoid visible flashes while mapping.
+    for info in &windows {
+        xconn.conn.configure_window(
+            info.frame_window,
+            &ConfigureWindowAux::new()
+                .sibling(overview.window)
+                .stack_mode(StackMode::BELOW),
+        )?;
+        xconn.conn.configure_window(
+            info.client_window,
+            &ConfigureWindowAux::new()
+                .sibling(overview.window)
+                .stack_mode(StackMode::BELOW),
+        )?;
+    }
+    // Map all windows so we can capture them (they will be unmapped on exit as needed)
+    let mapped_any = desktop::map_all_windows(&xconn, &windows)?;
+    xconn.flush()?;
+    log::info!("Mapped all {} windows for live capture", windows.len());
+    // Give X server time to process all maps and make windows ready for capture
+    xconn.sync()?;
+    if mapped_any {
+        // Extra delay for windows that were unmapped - they need time to redraw
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        xconn.sync()?;
+    }
+    xconn.conn.ungrab_server()?;
     // Load saved state and apply consistent ordering
     let mut window_state = WindowState::load();
     let current_hash = WindowState::compute_hash(&windows);
@@ -398,25 +453,83 @@ fn run() -> Result<()> {
     }
 
     // Capture window contents (managed windows)
+    // Failed captures get placeholders that we'll try to upgrade during animation
     let mut captures: Vec<CapturedWindow> = Vec::new();
+    let mut placeholder_indices: HashSet<usize> = HashSet::new();
     for window in &windows {
         match xconn.capture_window(window) {
             Ok(capture) => captures.push(capture),
-            Err(e) => log::warn!("Failed to capture window {:?}: {}", window.wm_name, e),
+            Err(e) => {
+                log::debug!("Capture failed for {:?}, using placeholder: {}", window.wm_name, e);
+                // Create placeholder so window still appears in layout
+                match xconn.create_placeholder_capture(window) {
+                    Ok(placeholder) => {
+                        placeholder_indices.insert(captures.len());
+                        captures.push(placeholder);
+                    }
+                    Err(e2) => log::warn!("Failed to create placeholder for {:?}: {}", window.wm_name, e2),
+                }
+            }
         }
     }
 
     if captures.is_empty() {
         log::info!("No windows could be captured");
+        xconn.destroy_overview(&overview)?;
         return Ok(());
     }
 
-    // Capture skipped windows (for fade effect)
+    // Capture skipped windows (for fade effect) - no placeholders needed
     let mut skipped_captures: Vec<CapturedWindow> = Vec::new();
     for window in &skipped_windows {
         match xconn.capture_window(window) {
             Ok(capture) => skipped_captures.push(capture),
-            Err(e) => log::warn!("Failed to capture skipped window {:?}: {}", window.wm_name, e),
+            Err(e) => log::debug!("Skipped window {:?} not captured: {}", window.wm_name, e),
+        }
+    }
+
+    // NOTE: Windows from other desktops stay off-screen during xpose's run.
+    // They'll be restored on exit via restore_window_visibility (which unmaps them anyway).
+    // The exit animation uses stored WindowInfo positions, not current window positions.
+
+    // Update stacking order for the CURRENT desktop only from the X11 stacking order.
+    // Other desktops keep their saved stacking orders since X11 only knows the
+    // accurate stacking for mapped (visible) windows.
+    let current_desktop_stacking: Vec<Window> = original_stacking_order
+        .iter()
+        .copied()
+        .filter(|&frame| current_window_ids.contains(&frame))
+        .collect();
+    log::info!("Updating stacking for current desktop {} with {} windows:", current_desktop, current_desktop_stacking.len());
+    for (i, &frame) in current_desktop_stacking.iter().enumerate() {
+        let name = captures.iter()
+            .find(|c| c.info.frame_window == frame)
+            .and_then(|c| c.info.wm_name.as_deref())
+            .unwrap_or("?");
+        log::info!("  [{}] {:?} (0x{:x})", i, name, frame);
+    }
+    desktop_state.stacking.insert(
+        current_desktop,
+        current_desktop_stacking.iter().map(|id| id.to_string()).collect(),
+    );
+
+    // Log stacking for other desktops (from saved state)
+    for desk in 0..desktop_state.desktops {
+        if desk != current_desktop {
+            if let Some(order) = desktop_state.stacking.get(&desk) {
+                log::info!("Desktop {} stacking (from saved state): {} windows", desk, order.len());
+                for (i, id_str) in order.iter().enumerate() {
+                    if let Ok(frame) = id_str.parse::<Window>() {
+                        let name = captures.iter()
+                            .find(|c| c.info.frame_window == frame)
+                            .and_then(|c| c.info.wm_name.as_deref())
+                            .unwrap_or("?");
+                        log::info!("  [{}] {:?} (0x{:x})", i, name, frame);
+                    }
+                }
+            } else {
+                log::info!("Desktop {} has NO saved stacking order", desk);
+            }
         }
     }
 
@@ -432,13 +545,10 @@ fn run() -> Result<()> {
 
     // Calculate layout for windows on the current desktop only
     let config = LayoutConfig::default();
-    let current_desktop = desktop_state.current;
     let grid_indices: Vec<usize> = captures
         .iter()
         .enumerate()
-        .filter(|(_, capture)| {
-            desktop_state.is_visible_on(capture.info.frame_window, current_desktop)
-        })
+        .filter(|(_, capture)| current_window_ids.contains(&capture.info.frame_window))
         .map(|(i, _)| i)
         .collect();
     let grid_infos: Vec<window_finder::WindowInfo> = grid_indices
@@ -470,35 +580,6 @@ fn run() -> Result<()> {
         );
     }
 
-    // Create overview window
-    let overview = xconn.create_overview_window()?;
-
-    // Map window and grab input before animation
-    xconn.conn.map_window(overview.window)?;
-
-    // Grab keyboard
-    xconn.conn.grab_keyboard(
-        true,
-        overview.window,
-        x11rb::CURRENT_TIME,
-        GrabMode::ASYNC,
-        GrabMode::ASYNC,
-    )?;
-
-    // Grab pointer
-    xconn.conn.grab_pointer(
-        true,
-        overview.window,
-        (EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION).into(),
-        GrabMode::ASYNC,
-        GrabMode::ASYNC,
-        overview.window,
-        0u32,
-        x11rb::CURRENT_TIME,
-    )?;
-
-    xconn.flush()?;
-
     // Run entrance animation
     let start_layouts: Vec<AnimatedLayout> = grid_infos
         .iter()
@@ -522,6 +603,64 @@ fn run() -> Result<()> {
             layouts.iter().position(|l| l.window_index == capture_idx)
         })
         .collect();
+
+    // Render first frame before starting the animation loop.
+    {
+        let current = animator.current_layouts();
+        xconn.clear_overview(&overview)?;
+        if let Some(ref bar) = desktop_bar {
+            let bar_y_offset = -(bar_height as i16);
+            render_desktop_bar(&xconn, &overview, bar, bar_y_offset, None, &captures)?;
+        }
+        // Render skipped windows at full opacity (matches progress=0 in animation loop).
+        for capture in &skipped_captures {
+            xconn.render_window_with_opacity(
+                capture.picture,
+                overview.picture,
+                capture.info.x,
+                capture.info.y,
+                capture.info.width,
+                capture.info.height,
+                1.0,
+            )?;
+        }
+        for &layout_idx in &render_order {
+            let layout = &current[layout_idx];
+            let idx = layout.window_index;
+            xconn.render_thumbnail_animated(
+                captures[idx].picture,
+                overview.picture,
+                captures[idx].info.width,
+                captures[idx].info.height,
+                layout,
+            )?;
+            xconn.draw_thumbnail_border_animated(&overview, layout, false)?;
+        }
+
+        // Now map the overview window - content is fully rendered so no flash
+        xconn.conn.map_window(overview.window)?;
+        xconn.present_overview(&overview)?;
+    }
+
+    // Grab input before animation
+    xconn.conn.grab_keyboard(
+        true,
+        overview.window,
+        x11rb::CURRENT_TIME,
+        GrabMode::ASYNC,
+        GrabMode::ASYNC,
+    )?;
+    xconn.conn.grab_pointer(
+        true,
+        overview.window,
+        (EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION).into(),
+        GrabMode::ASYNC,
+        GrabMode::ASYNC,
+        overview.window,
+        0u32,
+        x11rb::CURRENT_TIME,
+    )?;
+    xconn.flush()?;
 
     // Animation loop - fade out skipped windows while animating managed windows
     while !animator.is_complete() {
@@ -807,7 +946,7 @@ fn run() -> Result<()> {
                                 end_width: target_width,
                                 end_height: target_height,
                                 start_time: Instant::now(),
-                                duration_ms: SNAP_DURATION_MS,
+                                duration_ms: snap_duration_ms,
                             });
                         }
                     }
@@ -833,7 +972,7 @@ fn run() -> Result<()> {
                                     end_width: layout.width,
                                     end_height: layout.height,
                                     start_time: Instant::now(),
-                                    duration_ms: REVERT_DURATION_MS,
+                                duration_ms: revert_duration_ms,
                                 });
                             }
                         }
@@ -883,6 +1022,29 @@ fn run() -> Result<()> {
             }
             damaged_windows.clear();
             needs_present = true;
+        }
+
+        // Try to upgrade placeholder captures to real ones
+        if !placeholder_indices.is_empty() {
+            let mut upgraded: Vec<usize> = Vec::new();
+            for &idx in &placeholder_indices {
+                if idx < captures.len() && xconn.try_upgrade_placeholder(&mut captures[idx]) {
+                    upgraded.push(idx);
+                    // Re-render this thumbnail with real content
+                    let highlighted = last_hovered == Some(idx);
+                    redraw_thumbnail(&xconn, &captures, &layouts, &overview, idx, highlighted)?;
+                }
+            }
+            if !upgraded.is_empty() {
+                for idx in upgraded {
+                    placeholder_indices.remove(&idx);
+                }
+                // Re-render desktop bar with updated captures
+                if let Some(ref bar) = desktop_bar {
+                    render_desktop_bar(&xconn, &overview, bar, 0, input_handler.hovered_desktop(), &captures)?;
+                }
+                needs_present = true;
+            }
         }
 
         // Process drag animation frames
@@ -949,7 +1111,7 @@ fn run() -> Result<()> {
                         grid_transition_animation = Some(GridTransitionAnimation::new(
                             &old_layouts,
                             &new_layouts,
-                            GRID_TRANSITION_DURATION_MS,
+                            grid_transition_duration_ms,
                         ));
 
                         // Update layouts to new positions (animation will interpolate)
@@ -1234,6 +1396,18 @@ fn render_all_thumbnails(
         xconn.draw_thumbnail_border(overview, layout, Some(idx) == highlighted)?;
     }
     Ok(())
+}
+
+fn scale_duration(duration: std::time::Duration, speed: f64) -> std::time::Duration {
+    let speed = if speed > 0.0 { speed } else { 1.0 };
+    let scaled = duration.as_secs_f64() / speed;
+    std::time::Duration::from_secs_f64(scaled.max(0.0))
+}
+
+fn scale_duration_ms(ms: u64, speed: f64) -> u64 {
+    let speed = if speed > 0.0 { speed } else { 1.0 };
+    let scaled = (ms as f64 / speed).max(1.0);
+    scaled.round() as u64
 }
 
 fn find_layout(layouts: &[ThumbnailLayout], window_index: usize) -> Option<&ThumbnailLayout> {

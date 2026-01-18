@@ -55,7 +55,9 @@ pub struct PlusButtonLayout {
 /// Complete desktop bar state and layout.
 #[derive(Clone)]
 pub struct DesktopBar {
+    #[allow(dead_code)]
     pub num_desktops: u32,
+    #[allow(dead_code)]
     pub current_desktop: u32,
     pub preview_layouts: Vec<DesktopPreviewLayout>,
     pub plus_button: PlusButtonLayout,
