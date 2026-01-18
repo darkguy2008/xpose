@@ -168,11 +168,14 @@ impl DesktopBar {
         for preview in &mut self.preview_layouts {
             preview.mini_windows.clear();
 
-            // Desktop indices in our UI are 0-based, but state uses 1-based for desktop assignment
-            let state_desktop = preview.desktop_index + 1;
-
-            // Get window IDs for this desktop (including sticky windows)
-            let window_ids = desktop_state.windows_on_desktop(state_desktop);
+            // Get window IDs for this desktop (0-indexed)
+            let window_ids = desktop_state.windows_on_desktop(preview.desktop_index);
+            log::info!(
+                "Desktop {} preview: desktop_state.windows_on_desktop({}) returned {} windows",
+                preview.desktop_index,
+                preview.desktop_index,
+                window_ids.len()
+            );
 
             for window_id in window_ids {
                 // Find the capture for this window (try both client and frame)
@@ -181,6 +184,12 @@ impl DesktopBar {
                 });
 
                 if let Some(cap) = capture {
+                    log::info!(
+                        "  Desktop {}: Adding window {:?} (0x{:x})",
+                        preview.desktop_index,
+                        cap.info.wm_name,
+                        window_id
+                    );
                     // Scale window position and size to preview coordinates
                     let mini_x = (cap.info.x as f64 * scale_x) as i16;
                     let mini_y = (cap.info.y as f64 * scale_y) as i16;

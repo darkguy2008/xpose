@@ -14,13 +14,15 @@ const DEFAULT_DESKTOP_COUNT: u32 = 4;
 ///
 /// Tracks which desktop each window belongs to and synchronizes
 /// with X11 root window properties for cross-instance communication.
+///
+/// All desktop numbers are 0-indexed (0, 1, 2, 3, ...).
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct DesktopState {
-    /// Current desktop (0-indexed internally)
+    /// Current desktop (0-indexed)
     pub current: u32,
     /// Total number of desktops
     pub desktops: u32,
-    /// Window ID (as string) -> desktop number (0=sticky, 1+=specific)
+    /// Window ID (as string) -> desktop number (0-indexed)
     pub windows: HashMap<String, u32>,
     /// Windows hidden by the application itself (not by desktop switch)
     #[serde(default)]
@@ -88,7 +90,7 @@ impl DesktopState {
 
     /// Get desktop for a window, assigning to current desktop if new.
     ///
-    /// Returns the desktop number (0=sticky, 1+=specific desktop).
+    /// Returns the desktop number (0-indexed).
     pub fn get_window_desktop(&mut self, window_id: Window, current_desktop: u32) -> u32 {
         let key = window_id.to_string();
 
@@ -96,10 +98,9 @@ impl DesktopState {
             return desktop;
         }
 
-        // New window: assign to current desktop (stored as 1-indexed)
-        let assigned = current_desktop + 1;
-        self.windows.insert(key, assigned);
-        assigned
+        // New window: assign to current desktop (0-indexed)
+        self.windows.insert(key, current_desktop);
+        current_desktop
     }
 
     /// Set desktop for a window.
@@ -109,7 +110,7 @@ impl DesktopState {
 
     /// Check if window should be visible on the given desktop.
     ///
-    /// The desktop parameter is 0-indexed.
+    /// All desktop numbers are 0-indexed.
     /// Returns false for app-hidden windows regardless of desktop.
     pub fn is_visible_on(&self, window_id: Window, desktop: u32) -> bool {
         let key = window_id.to_string();
@@ -119,11 +120,7 @@ impl DesktopState {
         }
 
         match self.windows.get(&key) {
-            Some(&win_desktop) => {
-                // 0 = sticky (visible everywhere)
-                // 1+ = specific desktop (convert to 0-indexed for comparison)
-                win_desktop == 0 || win_desktop == desktop + 1
-            }
+            Some(&win_desktop) => win_desktop == desktop,
             None => true, // Unknown windows visible until assigned
         }
     }
@@ -180,11 +177,11 @@ impl DesktopState {
         self.windows.get(&key).copied()
     }
 
-    /// Get all windows assigned to a specific desktop (1-indexed), including sticky (0).
+    /// Get all windows assigned to a specific desktop (0-indexed).
     /// Returns window IDs in stacking order (bottom to top) if available.
     pub fn windows_on_desktop(&self, desktop: u32) -> Vec<Window> {
         // Get stacking order for this desktop if available
-        let stacking = self.stacking.get(&(desktop.saturating_sub(1)));
+        let stacking = self.stacking.get(&desktop);
 
         // Collect windows that should be visible on this desktop
         let mut result: Vec<Window> = Vec::new();
@@ -194,8 +191,7 @@ impl DesktopState {
             for id_str in order {
                 if let Ok(id) = id_str.parse::<Window>() {
                     if let Some(&win_desktop) = self.windows.get(id_str) {
-                        // 0 = sticky, matches all desktops
-                        if win_desktop == 0 || win_desktop == desktop {
+                        if win_desktop == desktop {
                             result.push(id);
                         }
                     }
@@ -205,7 +201,7 @@ impl DesktopState {
 
         // Also add any windows not in stacking order
         for (id_str, &win_desktop) in &self.windows {
-            if win_desktop == 0 || win_desktop == desktop {
+            if win_desktop == desktop {
                 if let Ok(id) = id_str.parse::<Window>() {
                     if !result.contains(&id) {
                         result.push(id);

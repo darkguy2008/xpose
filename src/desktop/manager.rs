@@ -128,9 +128,8 @@ pub fn switch_prev(xconn: &XConnection, state: &mut DesktopState, windows: &[Win
     Ok(prev)
 }
 
-/// Move a window to a specific desktop.
+/// Move a window to a specific desktop (0-indexed).
 ///
-/// Desktop 0 makes the window sticky (visible on all desktops).
 /// Note: When xpose is active, all windows are mapped for live capture,
 /// so this only updates the state without changing actual visibility.
 pub fn move_window(
@@ -139,11 +138,11 @@ pub fn move_window(
     window_id: Window,
     desktop: u32,
 ) -> Result<()> {
-    if desktop > state.desktops {
+    if desktop >= state.desktops {
         return Err(crate::error::XposeError::Other(format!(
-            "Invalid desktop {}. Valid range: 0-{} (0=sticky)",
+            "Invalid desktop {}. Valid range: 0-{}",
             desktop,
-            state.desktops
+            state.desktops - 1
         )));
     }
 
@@ -151,31 +150,25 @@ pub fn move_window(
     let old_desktop = state.get_window_desktop_assignment(window_id);
 
     // If we're currently on one of the affected desktops, save its stacking order first
-    let current_desktop_index = state.current;
-    let is_source_current = old_desktop.map(|d| d == current_desktop_index + 1).unwrap_or(false);
-    let is_dest_current = desktop == current_desktop_index + 1;
+    let current_desktop = state.current;
+    let is_source_current = old_desktop.map(|d| d == current_desktop).unwrap_or(false);
+    let is_dest_current = desktop == current_desktop;
 
     if is_source_current || is_dest_current {
-        save_stacking_order(xconn, state, current_desktop_index)?;
+        save_stacking_order(xconn, state, current_desktop)?;
     }
 
-    // Remove window from old desktop's stacking order (if it had one)
+    // Remove window from old desktop's stacking order
     if let Some(old_desk) = old_desktop {
-        if old_desk > 0 {
-            // old_desk is 1-indexed, convert to 0-indexed
-            state.remove_from_stacking(window_id, old_desk - 1);
-        }
+        state.remove_from_stacking(window_id, old_desk);
     }
 
     // Update window's desktop assignment
     state.set_window_desktop(window_id, desktop);
     state.set_app_hidden(window_id, false);
 
-    // Add window to new desktop's stacking order (if not sticky)
-    if desktop > 0 {
-        // desktop is 1-indexed, convert to 0-indexed
-        state.add_to_stacking(window_id, desktop - 1);
-    }
+    // Add window to new desktop's stacking order
+    state.add_to_stacking(window_id, desktop);
 
     // Note: We do NOT change window visibility here because xpose keeps all windows
     // mapped for live capture. Visibility will be restored when xpose exits.
@@ -198,11 +191,12 @@ pub fn set_desktop_count(
         ));
     }
 
-    // Move windows from removed desktops to the last valid one
+    // Move windows from removed desktops to the last valid one (0-indexed)
     if count < state.desktops {
+        let max_valid = count - 1;
         for win_desktop in state.windows.values_mut() {
-            if *win_desktop > count {
-                *win_desktop = count;
+            if *win_desktop >= count {
+                *win_desktop = max_valid;
             }
         }
     }
@@ -223,14 +217,21 @@ pub fn set_desktop_count(
 
 /// Map all windows (used when xpose starts to enable live capture).
 pub fn map_all_windows(xconn: &XConnection, windows: &[WindowInfo]) -> Result<()> {
+    let mut mapped_any = false;
     for info in windows {
         if !info.is_mapped {
             xconn.map_window(info.frame_window)?;
+            mapped_any = true;
         }
     }
     xconn.flush()?;
-    // Give X server a moment to process all maps
+    // Give X server time to process all maps and make windows ready for capture
     xconn.sync()?;
+    if mapped_any {
+        // Extra delay for windows that were unmapped - they need time to redraw
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        xconn.sync()?;
+    }
     Ok(())
 }
 

@@ -1058,6 +1058,78 @@ impl XConnection {
 
         Ok(())
     }
+
+    /// Render a desktop preview at an animated position/size (for zoom animation).
+    /// This renders the wallpaper and mini-windows scaled to the given rectangle.
+    pub fn render_desktop_preview_animated(
+        &self,
+        overview: &OverviewWindow,
+        preview: &DesktopPreviewLayout,
+        captures: &[CapturedWindow],
+        dst_x: i16,
+        dst_y: i16,
+        dst_width: u16,
+        dst_height: u16,
+    ) -> Result<()> {
+        if dst_width == 0 || dst_height == 0 {
+            return Ok(());
+        }
+
+        // 1. Render scaled wallpaper as background
+        if let Some(bg_pic) = overview.bg_picture {
+            self.render_wallpaper_scaled(
+                bg_pic,
+                overview.picture,
+                dst_x,
+                dst_y,
+                dst_width,
+                dst_height,
+            )?;
+        } else {
+            // Fallback: solid color background
+            self.conn
+                .change_gc(overview.gc, &ChangeGCAux::new().foreground(0x2a2a2a))?;
+            self.conn.poly_fill_rectangle(
+                overview.pixmap,
+                overview.gc,
+                &[Rectangle {
+                    x: dst_x,
+                    y: dst_y,
+                    width: dst_width,
+                    height: dst_height,
+                }],
+            )?;
+        }
+
+        // 2. Render mini-windows scaled proportionally
+        // Calculate scale factors from original preview size to animated size
+        let scale_x = dst_width as f64 / preview.width as f64;
+        let scale_y = dst_height as f64 / preview.height as f64;
+
+        for mini in &preview.mini_windows {
+            // Find the capture by frame window ID
+            if let Some(capture) = captures.iter().find(|c| c.info.frame_window == mini.window_id) {
+                // Scale mini-window position and size
+                let mini_x = dst_x + (mini.x as f64 * scale_x) as i16;
+                let mini_y = dst_y + (mini.y as f64 * scale_y) as i16;
+                let mini_w = (mini.width as f64 * scale_x) as u16;
+                let mini_h = (mini.height as f64 * scale_y) as u16;
+
+                self.render_mini_thumbnail(
+                    capture.picture,
+                    overview.picture,
+                    capture.info.width,
+                    capture.info.height,
+                    mini_x,
+                    mini_y,
+                    mini_w,
+                    mini_h,
+                )?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 // TODO: Future enhancements
