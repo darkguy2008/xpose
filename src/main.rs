@@ -1321,6 +1321,16 @@ fn run() -> Result<()> {
     // Cleanup
     log::debug!("Cleaning up");
 
+    // Restore original X positions for windows that were moved off-screen
+    // Use the original `windows` array which has positions from before we moved them
+    for info in &windows {
+        xconn.conn.configure_window(
+            info.frame_window,
+            &ConfigureWindowAux::new().x(info.x as i32),
+        )?;
+    }
+    xconn.flush()?;
+
     // Restore window visibility based on current desktop (unmap windows on other desktops)
     desktop::restore_window_visibility(&xconn, &desktop_state, &windows)?;
     log::info!("Restored window visibility for desktop {}", desktop_state.current);
