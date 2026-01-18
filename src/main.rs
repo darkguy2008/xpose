@@ -178,6 +178,44 @@ impl DesktopBarAnimation {
     }
 }
 
+/// Animation state for desktop gap during drag.
+/// Smoothly interpolates desktop positions when the insert position changes.
+struct DragGapAnimation {
+    /// Current animated X position for each non-dragged desktop
+    positions: std::collections::HashMap<u32, f64>,
+    /// Target X position for each desktop (from calculate_layouts_with_gap)
+    targets: std::collections::HashMap<u32, i16>,
+    /// Animation speed factor (higher = faster slide)
+    lerp_factor: f64,
+}
+
+impl DragGapAnimation {
+    fn new(initial_positions: &[(u32, i16)]) -> Self {
+        Self {
+            positions: initial_positions.iter().map(|&(idx, x)| (idx, x as f64)).collect(),
+            targets: initial_positions.iter().cloned().collect(),
+            lerp_factor: 0.25,
+        }
+    }
+
+    fn update_targets(&mut self, new_targets: &[(u32, i16)]) {
+        self.targets = new_targets.iter().cloned().collect();
+    }
+
+    fn step(&mut self) {
+        for (&idx, pos) in &mut self.positions {
+            if let Some(&target) = self.targets.get(&idx) {
+                let diff = target as f64 - *pos;
+                *pos += diff * self.lerp_factor;
+            }
+        }
+    }
+
+    fn get_positions(&self) -> Vec<(u32, i16)> {
+        self.positions.iter().map(|(&idx, &pos)| (idx, pos.round() as i16)).collect()
+    }
+}
+
 /// Calculate drag scale factor and target size based on Y position.
 /// Interpolates from drag start position (scale=1.0) to desktop preview bottom (scale=target_scale).
 fn calculate_drag_scale_and_target(
@@ -778,7 +816,9 @@ fn run() -> Result<()> {
     // Desktop drag state
     let mut desktop_dragging: Option<u32> = None;
     let mut desktop_insert_position: Option<u32> = None;
+    let mut desktop_drag_cursor_x: i16 = 0;
     let mut desktop_bar_animation: Option<DesktopBarAnimation> = None;
+    let mut drag_gap_animation: Option<DragGapAnimation> = None;
 
     loop {
         // Process all pending events (non-blocking after first)
@@ -862,6 +902,11 @@ fn run() -> Result<()> {
                 }
                 InputAction::ClickPlusButton => {
                     log::info!("Adding new desktop");
+
+                    // Store old bar for animation
+                    let old_bar = desktop_bar.clone();
+                    let old_count = desktop_state.desktops;
+
                     let new_count = desktop_state.desktops + 1;
                     desktop::set_desktop_count(&xconn, &mut desktop_state, &windows, new_count)?;
 
@@ -871,6 +916,34 @@ fn run() -> Result<()> {
                         desktop_state.current,
                         xconn.screen_width,
                     ));
+
+                    // Create animation: existing desktops slide to new positions, new one appears
+                    if let (Some(old), Some(ref new_bar)) = (old_bar, &desktop_bar) {
+                        let mut transitions = std::collections::HashMap::new();
+                        for new_preview in &new_bar.preview_layouts {
+                            if new_preview.desktop_index < old_count {
+                                // Existing desktop - find its old position
+                                if let Some(old_preview) = old.preview_layouts.iter()
+                                    .find(|p| p.desktop_index == new_preview.desktop_index)
+                                {
+                                    if old_preview.x != new_preview.x {
+                                        transitions.insert(new_preview.desktop_index, (old_preview.x, new_preview.x));
+                                    }
+                                }
+                            } else {
+                                // New desktop - animate from right edge
+                                transitions.insert(new_preview.desktop_index, (xconn.screen_width as i16, new_preview.x));
+                            }
+                        }
+                        if !transitions.is_empty() {
+                            desktop_bar_animation = Some(DesktopBarAnimation {
+                                transitions,
+                                start_time: std::time::Instant::now(),
+                                duration_ms: 200,
+                            });
+                        }
+                    }
+
                     if let Some(ref mut bar) = desktop_bar {
                         bar.calculate_mini_layouts(
                             &captures,
@@ -881,7 +954,25 @@ fn run() -> Result<()> {
                     }
                     input_handler.update_desktop_bar(desktop_bar.clone());
 
-                    // Redraw
+                    // Animate the desktop bar
+                    if let (Some(ref anim), Some(ref bar)) = (&desktop_bar_animation, &desktop_bar) {
+                        while !anim.is_complete() {
+                            xconn.clear_overview(&overview)?;
+                            render_desktop_bar_animated(
+                                &xconn,
+                                &overview,
+                                bar,
+                                anim,
+                                &captures,
+                            )?;
+                            render_all_thumbnails(&xconn, &captures, &layouts, &overview, last_hovered, dragging_window_index)?;
+                            xconn.present_overview(&overview)?;
+                            std::thread::sleep(std::time::Duration::from_millis(16));
+                        }
+                    }
+                    desktop_bar_animation = None;
+
+                    // Final redraw
                     xconn.clear_overview(&overview)?;
                     if let Some(ref bar) = desktop_bar {
                         render_desktop_bar(&xconn, &overview, bar, 0, input_handler.hovered_desktop(), None, &captures)?;
@@ -984,7 +1075,25 @@ fn run() -> Result<()> {
                             );
                             input_handler.update_layouts(layouts.clone());
 
-                            // Redraw
+                            // Animate the desktop bar slide
+                            if let (Some(ref anim), Some(ref bar)) = (&desktop_bar_animation, &desktop_bar) {
+                                while !anim.is_complete() {
+                                    xconn.clear_overview(&overview)?;
+                                    render_desktop_bar_animated(
+                                        &xconn,
+                                        &overview,
+                                        bar,
+                                        anim,
+                                        &captures,
+                                    )?;
+                                    render_all_thumbnails(&xconn, &captures, &layouts, &overview, last_hovered, dragging_window_index)?;
+                                    xconn.present_overview(&overview)?;
+                                    std::thread::sleep(std::time::Duration::from_millis(16));
+                                }
+                            }
+                            desktop_bar_animation = None;
+
+                            // Final redraw
                             xconn.clear_overview(&overview)?;
                             if let Some(ref bar) = desktop_bar {
                                 render_desktop_bar(&xconn, &overview, bar, 0, input_handler.hovered_desktop(), None, &captures)?;
@@ -997,14 +1106,35 @@ fn run() -> Result<()> {
                 InputAction::StartDesktopDrag(desktop_idx) => {
                     log::info!("Started dragging desktop {}", desktop_idx);
                     desktop_dragging = Some(desktop_idx);
+
+                    // Initialize drag animation with current positions
+                    if let Some(ref bar) = desktop_bar {
+                        let initial_positions: Vec<(u32, i16)> = bar.preview_layouts
+                            .iter()
+                            .filter(|p| p.desktop_index != desktop_idx)
+                            .map(|p| (p.desktop_index, p.x))
+                            .collect();
+                        drag_gap_animation = Some(DragGapAnimation::new(&initial_positions));
+                    }
                     needs_present = true;
                 }
                 InputAction::DesktopDragMove(cursor_x, _cursor_y) => {
+                    desktop_drag_cursor_x = cursor_x;
                     if let (Some(dragged), Some(ref bar)) = (desktop_dragging, &desktop_bar) {
                         // Calculate insert position
                         desktop_insert_position = Some(bar.calculate_insert_position(cursor_x, dragged));
 
-                        // Render desktop bar with gap
+                        // Update animation targets and step
+                        let animated_positions = if let Some(ref mut anim) = drag_gap_animation {
+                            let new_targets = bar.calculate_layouts_with_gap(dragged, desktop_insert_position.unwrap());
+                            anim.update_targets(&new_targets);
+                            anim.step();
+                            Some(anim.get_positions())
+                        } else {
+                            None
+                        };
+
+                        // Render desktop bar with animated gap positions
                         xconn.clear_overview(&overview)?;
                         render_desktop_bar_with_drag(
                             &xconn,
@@ -1014,6 +1144,7 @@ fn run() -> Result<()> {
                             desktop_insert_position,
                             cursor_x,
                             &captures,
+                            animated_positions,
                         )?;
                         render_all_thumbnails(&xconn, &captures, &layouts, &overview, last_hovered, dragging_window_index)?;
                         needs_present = true;
@@ -1021,6 +1152,19 @@ fn run() -> Result<()> {
                 }
                 InputAction::DropDesktopAt(from_desktop, to_position) => {
                     log::info!("Reordering desktop {} to position {}", from_desktop, to_position);
+
+                    // Store gap layout positions (where non-dragged desktops are during drag)
+                    let gap_positions: std::collections::HashMap<u32, i16> = desktop_bar
+                        .as_ref()
+                        .map(|bar| {
+                            bar.calculate_layouts_with_gap(from_desktop, desktop_insert_position.unwrap_or(to_position))
+                                .into_iter()
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
+                    // Store dragged desktop's current position (at cursor)
+                    let dragged_x = desktop_drag_cursor_x - (crate::desktop_bar::PREVIEW_WIDTH / 2) as i16;
 
                     if let Err(e) = desktop::reorder_desktop(&xconn, &mut desktop_state, from_desktop, to_position) {
                         log::warn!("Failed to reorder desktop: {}", e);
@@ -1031,6 +1175,43 @@ fn run() -> Result<()> {
                             desktop_state.current,
                             xconn.screen_width,
                         ));
+
+                        // Create animation from drag positions to final positions
+                        if let Some(ref new_bar) = desktop_bar {
+                            let mut transitions = std::collections::HashMap::new();
+                            for new_preview in &new_bar.preview_layouts {
+                                // Figure out which old desktop ended up at this new index
+                                let old_desktop_idx = {
+                                    let new_idx = new_preview.desktop_index;
+                                    let final_pos = if from_desktop < to_position { to_position - 1 } else { to_position };
+                                    if new_idx == final_pos {
+                                        from_desktop // This is where the dragged desktop ended up
+                                    } else if from_desktop < to_position {
+                                        if new_idx >= from_desktop && new_idx < final_pos { new_idx + 1 } else { new_idx }
+                                    } else {
+                                        if new_idx > final_pos && new_idx <= from_desktop { new_idx - 1 } else { new_idx }
+                                    }
+                                };
+
+                                let old_x = if old_desktop_idx == from_desktop {
+                                    dragged_x // Dragged desktop was at cursor
+                                } else {
+                                    gap_positions.get(&old_desktop_idx).copied().unwrap_or(new_preview.x)
+                                };
+
+                                if old_x != new_preview.x {
+                                    transitions.insert(new_preview.desktop_index, (old_x, new_preview.x));
+                                }
+                            }
+                            if !transitions.is_empty() {
+                                desktop_bar_animation = Some(DesktopBarAnimation {
+                                    transitions,
+                                    start_time: std::time::Instant::now(),
+                                    duration_ms: 200,
+                                });
+                            }
+                        }
+
                         if let Some(ref mut bar) = desktop_bar {
                             bar.calculate_mini_layouts(
                                 &captures,
@@ -1040,12 +1221,31 @@ fn run() -> Result<()> {
                             );
                         }
                         input_handler.update_desktop_bar(desktop_bar.clone());
+
+                        // Animate the desktop bar slide
+                        if let (Some(ref anim), Some(ref bar)) = (&desktop_bar_animation, &desktop_bar) {
+                            while !anim.is_complete() {
+                                xconn.clear_overview(&overview)?;
+                                render_desktop_bar_animated(
+                                    &xconn,
+                                    &overview,
+                                    bar,
+                                    anim,
+                                    &captures,
+                                )?;
+                                render_all_thumbnails(&xconn, &captures, &layouts, &overview, last_hovered, dragging_window_index)?;
+                                xconn.present_overview(&overview)?;
+                                std::thread::sleep(std::time::Duration::from_millis(16));
+                            }
+                        }
+                        desktop_bar_animation = None;
                     }
 
                     desktop_dragging = None;
                     desktop_insert_position = None;
+                    drag_gap_animation = None;
 
-                    // Redraw
+                    // Final redraw
                     xconn.clear_overview(&overview)?;
                     if let Some(ref bar) = desktop_bar {
                         render_desktop_bar(&xconn, &overview, bar, 0, input_handler.hovered_desktop(), None, &captures)?;
@@ -1057,6 +1257,7 @@ fn run() -> Result<()> {
                     log::debug!("Desktop drag cancelled");
                     desktop_dragging = None;
                     desktop_insert_position = None;
+                    drag_gap_animation = None;
 
                     // Redraw without gap
                     xconn.clear_overview(&overview)?;
@@ -1233,7 +1434,17 @@ fn run() -> Result<()> {
             }
             // Also re-render the desktop bar so mini-thumbnails update
             if let Some(ref bar) = desktop_bar {
-                render_desktop_bar(&xconn, &overview, bar, 0, input_handler.hovered_desktop(), None, &captures)?;
+                if let Some(dragged) = desktop_dragging {
+                    // During desktop drag, use animated positions
+                    let animated_positions = drag_gap_animation.as_ref().map(|a| a.get_positions());
+                    render_desktop_bar_with_drag(
+                        &xconn, &overview, bar, dragged,
+                        desktop_insert_position, desktop_drag_cursor_x,
+                        &captures, animated_positions,
+                    )?;
+                } else {
+                    render_desktop_bar(&xconn, &overview, bar, 0, input_handler.hovered_desktop(), None, &captures)?;
+                }
             }
             damaged_windows.clear();
             needs_present = true;
@@ -1256,7 +1467,16 @@ fn run() -> Result<()> {
                 }
                 // Re-render desktop bar with updated captures
                 if let Some(ref bar) = desktop_bar {
-                    render_desktop_bar(&xconn, &overview, bar, 0, input_handler.hovered_desktop(), None, &captures)?;
+                    if let Some(dragged) = desktop_dragging {
+                        let animated_positions = drag_gap_animation.as_ref().map(|a| a.get_positions());
+                        render_desktop_bar_with_drag(
+                            &xconn, &overview, bar, dragged,
+                            desktop_insert_position, desktop_drag_cursor_x,
+                            &captures, animated_positions,
+                        )?;
+                    } else {
+                        render_desktop_bar(&xconn, &overview, bar, 0, input_handler.hovered_desktop(), None, &captures)?;
+                    }
                 }
                 needs_present = true;
             }
@@ -1269,7 +1489,16 @@ fn run() -> Result<()> {
 
             xconn.clear_overview(&overview)?;
             if let Some(ref bar) = desktop_bar {
-                render_desktop_bar(&xconn, &overview, bar, 0, None, None, &captures)?;
+                if let Some(dragged) = desktop_dragging {
+                    let animated_positions = drag_gap_animation.as_ref().map(|a| a.get_positions());
+                    render_desktop_bar_with_drag(
+                        &xconn, &overview, bar, dragged,
+                        desktop_insert_position, desktop_drag_cursor_x,
+                        &captures, animated_positions,
+                    )?;
+                } else {
+                    render_desktop_bar(&xconn, &overview, bar, 0, None, None, &captures)?;
+                }
             }
             // Hide the animating window from the grid during animation
             render_all_thumbnails(&xconn, &captures, &layouts, &overview, last_hovered, dragging_window_index)?;
@@ -1731,6 +1960,52 @@ fn render_desktop_bar(
     Ok(())
 }
 
+/// Render the desktop bar with animated positions (for slide animation after delete).
+fn render_desktop_bar_animated(
+    xconn: &XConnection,
+    overview: &OverviewWindow,
+    desktop_bar: &DesktopBar,
+    animation: &DesktopBarAnimation,
+    captures: &[CapturedWindow],
+) -> Result<()> {
+    // Render bar background
+    xconn.render_desktop_bar_background(overview, desktop_bar.bar_height, 0)?;
+
+    // Render desktop previews with animated X positions
+    for preview in &desktop_bar.preview_layouts {
+        let animated_x = animation.current_x(preview.desktop_index, preview.x);
+        let mut animated_preview = preview.clone();
+        animated_preview.x = animated_x;
+
+        xconn.render_desktop_preview_full(
+            overview,
+            &animated_preview,
+            captures,
+            preview.is_current,
+            0,
+        )?;
+
+        // Render delete button if more than 1 desktop
+        if desktop_bar.num_desktops > 1 {
+            let del_x = animated_x + preview.delete_button_x;
+            let del_y = preview.y + preview.delete_button_y;
+            xconn.render_delete_button(
+                overview,
+                del_x,
+                del_y,
+                preview.delete_button_size,
+                false,
+            )?;
+        }
+    }
+
+    // Render plus button
+    let pb = &desktop_bar.plus_button;
+    xconn.render_plus_button(overview, pb.x, pb.y, pb.size, false)?;
+
+    Ok(())
+}
+
 /// Render the desktop bar with a desktop being dragged (shows gap for insertion).
 fn render_desktop_bar_with_drag(
     xconn: &XConnection,
@@ -1740,14 +2015,17 @@ fn render_desktop_bar_with_drag(
     insert_position: Option<u32>,
     cursor_x: i16,
     captures: &[CapturedWindow],
+    animated_positions: Option<Vec<(u32, i16)>>,
 ) -> Result<()> {
     use crate::desktop_bar::PREVIEW_WIDTH;
 
     // Render bar background
     xconn.render_desktop_bar_background(overview, desktop_bar.bar_height, 0)?;
 
-    // Calculate layouts with gap
-    let gap_layouts = if let Some(insert_pos) = insert_position {
+    // Use animated positions if provided, otherwise calculate from insert_position
+    let gap_layouts = if let Some(positions) = animated_positions {
+        positions
+    } else if let Some(insert_pos) = insert_position {
         desktop_bar.calculate_layouts_with_gap(dragged_desktop, insert_pos)
     } else {
         desktop_bar

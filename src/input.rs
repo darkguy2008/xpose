@@ -185,11 +185,6 @@ impl InputHandler {
         self.drag_state.as_mut()
     }
 
-    /// Get the current desktop drag state.
-    pub fn desktop_drag_state(&self) -> Option<&DesktopDragState> {
-        self.desktop_drag_state.as_ref()
-    }
-
     /// Update the layouts used for hit-testing.
     /// Called when the grid layout is recalculated (e.g., after removing windows).
     pub fn update_layouts(&mut self, new_layouts: Vec<ThumbnailLayout>) {
