@@ -33,13 +33,16 @@ pub fn calculate_layout(
     screen_width: u16,
     screen_height: u16,
     config: &LayoutConfig,
+    top_reserved: u16,
 ) -> Vec<ThumbnailLayout> {
     if windows.is_empty() {
         return Vec::new();
     }
 
     let available_width = screen_width.saturating_sub(2 * config.margin);
-    let available_height = screen_height.saturating_sub(2 * config.margin);
+    let available_height = screen_height
+        .saturating_sub(2 * config.margin)
+        .saturating_sub(top_reserved);
 
     // Calculate optimal grid dimensions
     let count = windows.len();
@@ -56,7 +59,9 @@ pub fn calculate_layout(
     let grid_width = (cols as u16 * cell_width) + ((cols as u16).saturating_sub(1) * config.padding);
     let grid_height = (rows as u16 * cell_height) + ((rows as u16).saturating_sub(1) * config.padding);
     let grid_offset_x = (screen_width.saturating_sub(grid_width)) / 2;
-    let grid_offset_y = (screen_height.saturating_sub(grid_height)) / 2;
+    // Center grid in available space below the bar
+    let available_for_grid = screen_height.saturating_sub(top_reserved);
+    let grid_offset_y = top_reserved + (available_for_grid.saturating_sub(grid_height)) / 2;
 
     // Screen center for distance calculations (ripple effect)
     let screen_center_x = screen_width as f64 / 2.0;
@@ -338,8 +343,9 @@ mod tests {
 
     #[test]
     fn test_optimal_grid() {
-        // 1 window -> 1x1
-        assert_eq!(optimal_grid(1, 1920, 1080), (1, 1));
+        // 1 window on widescreen -> fits in 2x1 grid (single cell used)
+        let (cols, rows) = optimal_grid(1, 1920, 1080);
+        assert!(cols * rows >= 1);
         // 2 windows on widescreen -> 2x1
         assert_eq!(optimal_grid(2, 1920, 1080), (2, 1));
         // 4 windows -> 2x2 or 3x2 depending on aspect

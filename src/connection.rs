@@ -40,6 +40,9 @@ atom_manager! {
         // Root window background pixmap atoms
         _XROOTPMAP_ID,
         ESETROOT_PMAP_ID,
+        // xdeskie virtual desktop atoms
+        _XDESKIE_NUM_DESKTOPS,
+        _XDESKIE_CURRENT_DESKTOP,
     }
 }
 
@@ -133,5 +136,39 @@ impl XConnection {
 
     pub fn generate_id(&self) -> Result<u32> {
         Ok(self.conn.generate_id()?)
+    }
+
+    /// Get the number of virtual desktops from xdeskie.
+    pub fn get_num_desktops(&self) -> Result<Option<u32>> {
+        let reply = self
+            .conn
+            .get_property(
+                false,
+                self.root,
+                self.atoms._XDESKIE_NUM_DESKTOPS,
+                AtomEnum::CARDINAL,
+                0,
+                1,
+            )?
+            .reply()?;
+
+        Ok(reply.value32().and_then(|mut v| v.next()))
+    }
+
+    /// Get the current active desktop from xdeskie.
+    pub fn get_current_desktop(&self) -> Result<Option<u32>> {
+        let reply = self
+            .conn
+            .get_property(
+                false,
+                self.root,
+                self.atoms._XDESKIE_CURRENT_DESKTOP,
+                AtomEnum::CARDINAL,
+                0,
+                1,
+            )?
+            .reply()?;
+
+        Ok(reply.value32().and_then(|mut v| v.next()))
     }
 }

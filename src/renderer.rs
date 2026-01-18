@@ -568,6 +568,192 @@ impl XConnection {
         self.conn.flush()?;
         Ok(())
     }
+
+    /// Render the desktop bar background.
+    pub fn render_desktop_bar_background(
+        &self,
+        overview: &OverviewWindow,
+        bar_height: u16,
+        bar_y_offset: i16,
+    ) -> Result<()> {
+        // Dark semi-transparent background
+        let bg_color = 0x1a1a1a;
+        self.conn
+            .change_gc(overview.gc, &ChangeGCAux::new().foreground(bg_color))?;
+        self.conn.poly_fill_rectangle(
+            overview.pixmap,
+            overview.gc,
+            &[Rectangle {
+                x: 0,
+                y: bar_y_offset,
+                width: overview.width,
+                height: bar_height,
+            }],
+        )?;
+        Ok(())
+    }
+
+    /// Render a desktop preview rectangle.
+    pub fn render_desktop_preview(
+        &self,
+        overview: &OverviewWindow,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+        is_current: bool,
+        is_hovered: bool,
+    ) -> Result<()> {
+        // Background color
+        let bg_color = if is_current { 0x3a3a3a } else { 0x2a2a2a };
+        self.conn
+            .change_gc(overview.gc, &ChangeGCAux::new().foreground(bg_color))?;
+        self.conn.poly_fill_rectangle(
+            overview.pixmap,
+            overview.gc,
+            &[Rectangle { x, y, width, height }],
+        )?;
+
+        // Border
+        let border_color = if is_current || is_hovered {
+            0x4488FF // Highlight
+        } else {
+            0x444444 // Normal
+        };
+        let border_width: i16 = 2;
+        self.conn.change_gc(
+            overview.gc,
+            &ChangeGCAux::new()
+                .foreground(border_color)
+                .line_width(border_width as u32),
+        )?;
+        self.conn.poly_rectangle(
+            overview.pixmap,
+            overview.gc,
+            &[Rectangle { x, y, width, height }],
+        )?;
+
+        Ok(())
+    }
+
+    /// Render a window being dragged at a specific position and size.
+    /// Used for drag feedback and snap/revert animations.
+    pub fn render_dragged_window(
+        &self,
+        src_picture: Picture,
+        dst_picture: Picture,
+        src_width: u16,
+        src_height: u16,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+    ) -> Result<()> {
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+
+        // Calculate scale factor (destination to source, for XRender inverse transform)
+        let scale_x = src_width as f64 / width as f64;
+        let scale_y = src_height as f64 / height as f64;
+
+        let transform = Transform {
+            matrix11: double_to_fixed(scale_x),
+            matrix12: 0,
+            matrix13: 0,
+            matrix21: 0,
+            matrix22: double_to_fixed(scale_y),
+            matrix23: 0,
+            matrix31: 0,
+            matrix32: 0,
+            matrix33: double_to_fixed(1.0),
+        };
+
+        render::set_picture_transform(&self.conn, src_picture, transform)?;
+        render::set_picture_filter(&self.conn, src_picture, b"bilinear", &[])?;
+
+        render::composite(
+            &self.conn,
+            PictOp::OVER,
+            src_picture,
+            x11rb::NONE,
+            dst_picture,
+            0,
+            0,
+            0,
+            0,
+            x,
+            y,
+            width,
+            height,
+        )?;
+
+        Ok(())
+    }
+
+    /// Render the plus button.
+    pub fn render_plus_button(
+        &self,
+        overview: &OverviewWindow,
+        x: i16,
+        y: i16,
+        size: u16,
+        is_hovered: bool,
+    ) -> Result<()> {
+        // Background circle (approximated with filled rectangle for now)
+        let bg_color = if is_hovered { 0x555555 } else { 0x444444 };
+        self.conn
+            .change_gc(overview.gc, &ChangeGCAux::new().foreground(bg_color))?;
+        self.conn.poly_fill_rectangle(
+            overview.pixmap,
+            overview.gc,
+            &[Rectangle {
+                x,
+                y,
+                width: size,
+                height: size,
+            }],
+        )?;
+
+        // Draw "+" symbol
+        let plus_color = 0xCCCCCC;
+        let line_width = 3u16;
+        let margin = size / 4;
+        self.conn.change_gc(
+            overview.gc,
+            &ChangeGCAux::new()
+                .foreground(plus_color)
+                .line_width(line_width as u32),
+        )?;
+
+        // Horizontal line
+        let h_y = y + (size / 2) as i16;
+        self.conn.poly_segment(
+            overview.pixmap,
+            overview.gc,
+            &[Segment {
+                x1: x + margin as i16,
+                y1: h_y,
+                x2: x + (size - margin) as i16,
+                y2: h_y,
+            }],
+        )?;
+
+        // Vertical line
+        let v_x = x + (size / 2) as i16;
+        self.conn.poly_segment(
+            overview.pixmap,
+            overview.gc,
+            &[Segment {
+                x1: v_x,
+                y1: y + margin as i16,
+                x2: v_x,
+                y2: y + (size - margin) as i16,
+            }],
+        )?;
+
+        Ok(())
+    }
 }
 
 // TODO: Future enhancements
