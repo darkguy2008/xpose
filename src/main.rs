@@ -9,8 +9,9 @@ mod layout;
 mod renderer;
 mod state;
 mod window_finder;
+mod xdeskie;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use x11rb::connection::Connection;
@@ -20,12 +21,21 @@ use x11rb::protocol::Event;
 
 use std::thread;
 
-// Drag animation constants
+// Animation constants
 const REVERT_DURATION_MS: u64 = 200;
 const SNAP_DURATION_MS: u64 = 150;
+const GRID_TRANSITION_DURATION_MS: u64 = 250;
+
+/// Animation mode: snap to desktop or revert to grid.
+#[derive(Debug, Clone)]
+enum AnimationMode {
+    SnapToDesktop { desktop_idx: usize },
+    RevertToGrid,
+}
 
 /// Animation state for drag revert or snap.
 struct DragAnimation {
+    mode: AnimationMode,
     window_index: usize,
     start_x: i16,
     start_y: i16,
@@ -61,6 +71,77 @@ impl DragAnimation {
         let h = self.start_height as f64 + (self.end_height as i32 - self.start_height as i32) as f64 * eased;
 
         (x as i16, y as i16, w.max(1.0) as u16, h.max(1.0) as u16)
+    }
+}
+
+/// Animation state for grid layout transitions when windows are removed.
+struct GridTransitionAnimation {
+    /// Map from window_index to (old_layout, new_layout)
+    transitions: HashMap<usize, (ThumbnailLayout, ThumbnailLayout)>,
+    start_time: Instant,
+    duration_ms: u64,
+}
+
+impl GridTransitionAnimation {
+    fn new(old_layouts: &[ThumbnailLayout], new_layouts: &[ThumbnailLayout], duration_ms: u64) -> Self {
+        let mut transitions = HashMap::new();
+
+        // Map new layouts by window_index for quick lookup
+        let new_map: HashMap<usize, &ThumbnailLayout> = new_layouts
+            .iter()
+            .map(|l| (l.window_index, l))
+            .collect();
+
+        // For each window in old layouts, if it exists in new layouts, create transition
+        for old_layout in old_layouts {
+            if let Some(&new_layout) = new_map.get(&old_layout.window_index) {
+                transitions.insert(
+                    old_layout.window_index,
+                    (old_layout.clone(), new_layout.clone()),
+                );
+            }
+        }
+
+        Self {
+            transitions,
+            start_time: Instant::now(),
+            duration_ms,
+        }
+    }
+
+    fn progress(&self) -> f64 {
+        let elapsed = self.start_time.elapsed().as_millis() as f64;
+        let duration = self.duration_ms as f64;
+        (elapsed / duration).min(1.0)
+    }
+
+    fn is_complete(&self) -> bool {
+        self.progress() >= 1.0
+    }
+
+    /// Get current interpolated layouts
+    fn current_layouts(&self) -> Vec<ThumbnailLayout> {
+        let t = self.progress();
+        // Ease-out cubic for smooth deceleration
+        let eased = 1.0 - (1.0 - t).powi(3);
+
+        self.transitions
+            .iter()
+            .map(|(&window_index, (old, new))| {
+                let x = old.x as f64 + (new.x - old.x) as f64 * eased;
+                let y = old.y as f64 + (new.y - old.y) as f64 * eased;
+                let width = old.width as f64 + (new.width as i32 - old.width as i32) as f64 * eased;
+                let height = old.height as f64 + (new.height as i32 - old.height as i32) as f64 * eased;
+
+                ThumbnailLayout {
+                    x: x as i16,
+                    y: y as i16,
+                    width: width.max(1.0) as u16,
+                    height: height.max(1.0) as u16,
+                    window_index,
+                }
+            })
+            .collect()
     }
 }
 
@@ -142,6 +223,61 @@ fn calculate_drag_rect(
     (x, y, width, height)
 }
 
+/// Recalculate grid layout for windows excluding removed ones.
+/// Filters out removed windows, recalculates layout, and remaps indices.
+fn recalculate_filtered_layout(
+    captures: &[CapturedWindow],
+    removed_windows: &HashSet<usize>,
+    screen_width: u16,
+    screen_height: u16,
+    config: &LayoutConfig,
+    top_reserved: u16,
+) -> Vec<ThumbnailLayout> {
+    // Filter out removed windows
+    let filtered_captures: Vec<&CapturedWindow> = captures
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !removed_windows.contains(i))
+        .map(|(_, capture)| capture)
+        .collect();
+
+    if filtered_captures.is_empty() {
+        return Vec::new();
+    }
+
+    // Create WindowInfo slice for layout calculation
+    let filtered_infos: Vec<window_finder::WindowInfo> = filtered_captures
+        .iter()
+        .map(|c| c.info.clone())
+        .collect();
+
+    // Calculate new layout for filtered windows
+    let new_layouts = calculate_layout(
+        &filtered_infos,
+        screen_width,
+        screen_height,
+        config,
+        top_reserved,
+    );
+
+    // Remap indices back to original capture indices
+    let filtered_indices: Vec<usize> = captures
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !removed_windows.contains(i))
+        .map(|(i, _)| i)
+        .collect();
+
+    new_layouts
+        .into_iter()
+        .enumerate()
+        .map(|(new_idx, mut layout)| {
+            layout.window_index = filtered_indices[new_idx];
+            layout
+        })
+        .collect()
+}
+
 use animation::{calculate_exit_layouts, calculate_start_layouts, AnimationConfig, Animator};
 use capture::CapturedWindow;
 use config::Config;
@@ -184,7 +320,7 @@ fn run() -> Result<()> {
     );
 
     // Initialize desktop bar (if xdeskie is running)
-    let desktop_bar = match (xconn.get_num_desktops()?, xconn.get_current_desktop()?) {
+    let mut desktop_bar = match (xconn.get_num_desktops()?, xconn.get_current_desktop()?) {
         (Some(num), Some(current)) if num > 0 => {
             log::info!("Desktop bar enabled: {} desktops, current={}", num, current);
             Some(DesktopBar::new(num, current, xconn.screen_width))
@@ -244,9 +380,22 @@ fn run() -> Result<()> {
         }
     }
 
+    // Load xdeskie state for window-to-desktop mappings
+    let xdeskie_state = xdeskie::XdeskieState::load();
+
+    // Calculate mini-layouts for desktop previews if xdeskie is running
+    if let (Some(ref mut bar), Some(ref state)) = (&mut desktop_bar, &xdeskie_state) {
+        bar.calculate_mini_layouts(
+            &captures,
+            state,
+            xconn.screen_width,
+            xconn.screen_height,
+        );
+    }
+
     // Calculate layout
     let config = LayoutConfig::default();
-    let layouts = calculate_layout(
+    let mut layouts = calculate_layout(
         &captures.iter().map(|c| c.info.clone()).collect::<Vec<_>>(),
         xconn.screen_width,
         xconn.screen_height,
@@ -324,7 +473,7 @@ fn run() -> Result<()> {
         // Render desktop bar (with slide-in animation)
         if let Some(ref bar) = desktop_bar {
             let bar_y_offset = (-(bar_height as f64) * (1.0 - progress)) as i16;
-            render_desktop_bar(&xconn, &overview, bar, bar_y_offset, None)?;
+            render_desktop_bar(&xconn, &overview, bar, bar_y_offset, None, &captures)?;
         }
 
         // Render skipped windows with fading opacity (1.0 → 0.0)
@@ -360,7 +509,7 @@ fn run() -> Result<()> {
 
     // Render final static state
     if let Some(ref bar) = desktop_bar {
-        render_desktop_bar(&xconn, &overview, bar, 0, None)?;
+        render_desktop_bar(&xconn, &overview, bar, 0, None, &captures)?;
     }
     render_all_thumbnails(&xconn, &captures, &layouts, &overview, None, None)?;
     xconn.present_overview(&overview)?;
@@ -380,6 +529,10 @@ fn run() -> Result<()> {
     let mut drag_animation: Option<DragAnimation> = None;
     let mut last_drag_rect: Option<(i16, i16, u16, u16)> = None;
     let mut dragging_window_index: Option<usize> = None; // Window being dragged (to hide from grid)
+    let mut removed_windows: HashSet<usize> = HashSet::new(); // Windows removed from grid (moved to desktops)
+
+    // Grid transition animation state
+    let mut grid_transition_animation: Option<GridTransitionAnimation> = None;
 
     loop {
         // Process all pending events (non-blocking after first)
@@ -487,7 +640,7 @@ fn run() -> Result<()> {
 
                         xconn.clear_overview(&overview)?;
                         if let Some(ref bar) = desktop_bar {
-                            render_desktop_bar(&xconn, &overview, bar, 0, input_handler.hovered_desktop())?;
+                            render_desktop_bar(&xconn, &overview, bar, 0, input_handler.hovered_desktop(), &captures)?;
                         }
                         render_all_thumbnails(&xconn, &captures, &layouts, &overview, last_hovered, dragging_window_index)?;
                         xconn.render_dragged_window(
@@ -516,7 +669,7 @@ fn run() -> Result<()> {
 
                         xconn.clear_overview(&overview)?;
                         if let Some(ref bar) = desktop_bar {
-                            render_desktop_bar(&xconn, &overview, bar, 0, input_handler.hovered_desktop())?;
+                            render_desktop_bar(&xconn, &overview, bar, 0, input_handler.hovered_desktop(), &captures)?;
                         }
                         render_all_thumbnails(&xconn, &captures, &layouts, &overview, last_hovered, dragging_window_index)?;
                         xconn.render_dragged_window(
@@ -539,6 +692,7 @@ fn run() -> Result<()> {
                             let target_height = (60.0 * aspect) as u16;
 
                             drag_animation = Some(DragAnimation {
+                                mode: AnimationMode::SnapToDesktop { desktop_idx: desktop_idx as usize },
                                 window_index: window_idx,
                                 start_x: rect.0,
                                 start_y: rect.1,
@@ -564,6 +718,7 @@ fn run() -> Result<()> {
                         if let Some(drag) = input_handler.drag_state() {
                             let layout = &layouts[drag.window_index];
                             drag_animation = Some(DragAnimation {
+                                mode: AnimationMode::RevertToGrid,
                                 window_index: drag.window_index,
                                 start_x: rect.0,
                                 start_y: rect.1,
@@ -586,7 +741,7 @@ fn run() -> Result<()> {
                     log::debug!("Hover desktop: {:?}", desktop_idx);
                     // Redraw desktop bar with hover highlight
                     if let Some(ref bar) = desktop_bar {
-                        render_desktop_bar(&xconn, &overview, bar, 0, desktop_idx)?;
+                        render_desktop_bar(&xconn, &overview, bar, 0, desktop_idx, &captures)?;
                         needs_present = true;
                     }
                 }
@@ -617,6 +772,10 @@ fn run() -> Result<()> {
                     redraw_thumbnail(&xconn, &captures, &layouts, &overview, idx, highlighted)?;
                 }
             }
+            // Also re-render the desktop bar so mini-thumbnails update
+            if let Some(ref bar) = desktop_bar {
+                render_desktop_bar(&xconn, &overview, bar, 0, input_handler.hovered_desktop(), &captures)?;
+            }
             damaged_windows.clear();
             needs_present = true;
         }
@@ -628,7 +787,7 @@ fn run() -> Result<()> {
 
             xconn.clear_overview(&overview)?;
             if let Some(ref bar) = desktop_bar {
-                render_desktop_bar(&xconn, &overview, bar, 0, None)?;
+                render_desktop_bar(&xconn, &overview, bar, 0, None, &captures)?;
             }
             // Hide the animating window from the grid during animation
             render_all_thumbnails(&xconn, &captures, &layouts, &overview, last_hovered, dragging_window_index)?;
@@ -640,8 +799,116 @@ fn run() -> Result<()> {
             needs_present = true;
 
             if anim.is_complete() {
+                match anim.mode {
+                    AnimationMode::SnapToDesktop { desktop_idx } => {
+                        // Get window ID for xdeskie (use client window)
+                        let window_id = captures[anim.window_index].info.client_window;
+
+                        // Call xdeskie to actually move the window
+                        // desktop_idx is 0-based in our UI, xdeskie uses 1-based
+                        let xdeskie_desktop = desktop_idx + 1;
+                        let result = std::process::Command::new("xdeskie")
+                            .args(["move", &format!("0x{:x}", window_id), &xdeskie_desktop.to_string()])
+                            .output();
+
+                        match result {
+                            Ok(output) if output.status.success() => {
+                                log::info!("Moved window 0x{:x} to desktop {}", window_id, xdeskie_desktop);
+                            }
+                            Ok(output) => {
+                                log::warn!("xdeskie move failed: {}", String::from_utf8_lossy(&output.stderr));
+                            }
+                            Err(e) => {
+                                log::warn!("Failed to run xdeskie: {}", e);
+                            }
+                        }
+
+                        // Reload xdeskie state and recalculate mini-layouts for desktop previews
+                        if let Some(ref mut bar) = desktop_bar {
+                            if let Some(state) = xdeskie::XdeskieState::load() {
+                                bar.calculate_mini_layouts(
+                                    &captures,
+                                    &state,
+                                    xconn.screen_width,
+                                    xconn.screen_height,
+                                );
+                            }
+                        }
+
+                        // Window was dropped on desktop - remove it from grid
+                        removed_windows.insert(anim.window_index);
+
+                        // Store old layouts before recalculation
+                        let old_layouts = layouts.clone();
+
+                        // Recalculate layout for remaining windows
+                        let new_layouts = recalculate_filtered_layout(
+                            &captures,
+                            &removed_windows,
+                            xconn.screen_width,
+                            xconn.screen_height,
+                            &config,
+                            bar_height,
+                        );
+
+                        // Start grid transition animation
+                        grid_transition_animation = Some(GridTransitionAnimation::new(
+                            &old_layouts,
+                            &new_layouts,
+                            GRID_TRANSITION_DURATION_MS,
+                        ));
+
+                        // Update layouts to new positions (animation will interpolate)
+                        layouts = new_layouts;
+
+                        // Update input handler with new layouts
+                        input_handler.update_layouts(layouts.clone());
+
+                        log::info!("Window {} removed from grid, moved to desktop {} - animating {} windows to new positions",
+                                  anim.window_index, desktop_idx, layouts.len());
+                    }
+                    AnimationMode::RevertToGrid => {
+                        // Window was dropped outside desktop - just return to grid
+                        // (No removal, window already in layouts)
+                    }
+                }
+
                 drag_animation = None;
-                dragging_window_index = None; // Show window back in grid
+                dragging_window_index = None;
+            }
+        }
+
+        // Process grid transition animation frames
+        if let Some(ref anim) = grid_transition_animation {
+            let current_layouts = anim.current_layouts();
+
+            xconn.clear_overview(&overview)?;
+            if let Some(ref bar) = desktop_bar {
+                render_desktop_bar(&xconn, &overview, bar, 0, None, &captures)?;
+            }
+
+            // Render thumbnails at interpolated positions
+            for layout in &current_layouts {
+                let capture = &captures[layout.window_index];
+                xconn.render_thumbnail(
+                    capture.picture,
+                    overview.picture,
+                    capture.info.width,
+                    capture.info.height,
+                    layout,
+                )?;
+            }
+            needs_present = true;
+
+            if anim.is_complete() {
+                grid_transition_animation = None;
+                // Final render with exact final positions
+                xconn.clear_overview(&overview)?;
+                if let Some(ref bar) = desktop_bar {
+                    render_desktop_bar(&xconn, &overview, bar, 0, None, &captures)?;
+                }
+                render_all_thumbnails(&xconn, &captures, &layouts, &overview, last_hovered, None)?;
+                needs_present = true;
             }
         }
 
@@ -650,7 +917,7 @@ fn run() -> Result<()> {
         }
 
         // Continue animation loop if animation is active
-        if drag_animation.is_some() {
+        if drag_animation.is_some() || grid_transition_animation.is_some() {
             thread::sleep(std::time::Duration::from_millis(16)); // ~60fps
             continue;
         }
@@ -663,17 +930,20 @@ fn run() -> Result<()> {
 
         // Build render order: original Z-order (bottom to top), with selected window last
         // Map from original_stacking_order (frame IDs) to indices in captures array
+        // Filter out removed windows
         let mut render_order: Vec<usize> = Vec::new();
         for frame in &original_stacking_order {
             if let Some(idx) = captures.iter().position(|c| c.info.frame_window == *frame) {
-                if Some(idx) != selected_window {
+                if !removed_windows.contains(&idx) && Some(idx) != selected_window {
                     render_order.push(idx);
                 }
             }
         }
-        // Add selected window last (renders on top)
+        // Add selected window last (renders on top) if it wasn't removed
         if let Some(idx) = selected_window {
-            render_order.push(idx);
+            if !removed_windows.contains(&idx) {
+                render_order.push(idx);
+            }
         }
 
         while !exit_animator.is_complete() {
@@ -697,14 +967,16 @@ fn run() -> Result<()> {
 
             // Render windows in original Z-order (bottom to top), selected window last
             for &idx in &render_order {
-                let layout = &current[idx];
-                xconn.render_thumbnail_animated(
-                    captures[idx].picture,
-                    overview.picture,
-                    captures[idx].info.width,
-                    captures[idx].info.height,
-                    layout,
-                )?;
+                // Find the layout for this window index
+                if let Some(layout) = current.iter().find(|l| l.window_index == idx) {
+                    xconn.render_thumbnail_animated(
+                        captures[idx].picture,
+                        overview.picture,
+                        captures[idx].info.width,
+                        captures[idx].info.height,
+                        layout,
+                    )?;
+                }
             }
 
             xconn.present_overview(&overview)?;
@@ -766,11 +1038,16 @@ fn render_all_thumbnails(
     highlighted: Option<usize>,
     excluded: Option<usize>,
 ) -> Result<()> {
-    for (i, (capture, layout)) in captures.iter().zip(layouts.iter()).enumerate() {
+    // Iterate over layouts and use window_index to find the correct capture.
+    // This is necessary because after windows are removed, layouts are filtered
+    // but captures remain unchanged - layout.window_index maps back to captures.
+    for layout in layouts {
+        let idx = layout.window_index;
         // Skip excluded window (being dragged)
-        if Some(i) == excluded {
+        if Some(idx) == excluded {
             continue;
         }
+        let capture = &captures[idx];
         xconn.render_thumbnail(
             capture.picture,
             overview.picture,
@@ -778,26 +1055,32 @@ fn render_all_thumbnails(
             capture.info.height,
             layout,
         )?;
-        xconn.draw_thumbnail_border(overview, layout, Some(i) == highlighted)?;
+        xconn.draw_thumbnail_border(overview, layout, Some(idx) == highlighted)?;
     }
     Ok(())
 }
 
 /// Redraw a single thumbnail (used for hover updates).
+/// `window_index` is the index into captures array (the window_index from layouts).
 fn redraw_thumbnail(
     xconn: &XConnection,
     captures: &[CapturedWindow],
     layouts: &[ThumbnailLayout],
     overview: &OverviewWindow,
-    index: usize,
+    window_index: usize,
     highlighted: bool,
 ) -> Result<()> {
-    if index >= captures.len() || index >= layouts.len() {
+    if window_index >= captures.len() {
         return Ok(());
     }
 
-    let capture = &captures[index];
-    let layout = &layouts[index];
+    // Find the layout for this window_index (can't use array index after filtering)
+    let layout = match layouts.iter().find(|l| l.window_index == window_index) {
+        Some(l) => l,
+        None => return Ok(()), // Window was removed from layouts
+    };
+
+    let capture = &captures[window_index];
 
     // Clear the area first
     xconn.clear_thumbnail_area(overview, layout)?;
@@ -824,21 +1107,20 @@ fn render_desktop_bar(
     desktop_bar: &DesktopBar,
     bar_y_offset: i16,
     hovered_desktop: Option<u32>,
+    captures: &[CapturedWindow],
 ) -> Result<()> {
     // Render bar background
     xconn.render_desktop_bar_background(overview, desktop_bar.bar_height, bar_y_offset)?;
 
-    // Render desktop previews
+    // Render desktop previews with wallpaper and mini-windows
     for preview in &desktop_bar.preview_layouts {
         let is_hovered = hovered_desktop == Some(preview.desktop_index);
-        xconn.render_desktop_preview(
+        xconn.render_desktop_preview_full(
             overview,
-            preview.x,
-            preview.y + bar_y_offset,
-            preview.width,
-            preview.height,
-            preview.is_current,
+            preview,
+            captures,
             is_hovered,
+            bar_y_offset,
         )?;
     }
 

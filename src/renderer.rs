@@ -2,7 +2,9 @@ use x11rb::connection::Connection;
 use x11rb::protocol::render::{self, Picture, PictOp, Transform};
 use x11rb::protocol::xproto::*;
 use crate::animation::AnimatedLayout;
+use crate::capture::CapturedWindow;
 use crate::connection::XConnection;
+use crate::desktop_bar::DesktopPreviewLayout;
 use crate::error::Result;
 use crate::layout::ThumbnailLayout;
 
@@ -593,7 +595,7 @@ impl XConnection {
         Ok(())
     }
 
-    /// Render a desktop preview rectangle.
+    /// Render a desktop preview rectangle (simple version, no window content).
     pub fn render_desktop_preview(
         &self,
         overview: &OverviewWindow,
@@ -631,6 +633,209 @@ impl XConnection {
             overview.pixmap,
             overview.gc,
             &[Rectangle { x, y, width, height }],
+        )?;
+
+        Ok(())
+    }
+
+    /// Render a desktop preview with wallpaper background and mini window thumbnails.
+    pub fn render_desktop_preview_full(
+        &self,
+        overview: &OverviewWindow,
+        preview: &DesktopPreviewLayout,
+        captures: &[CapturedWindow],
+        is_hovered: bool,
+        y_offset: i16,
+    ) -> Result<()> {
+        let preview_x = preview.x;
+        let preview_y = preview.y + y_offset;
+        let preview_w = preview.width;
+        let preview_h = preview.height;
+
+        // 1. Render scaled wallpaper as background
+        if let Some(bg_pic) = overview.bg_picture {
+            self.render_wallpaper_scaled(
+                bg_pic,
+                overview.picture,
+                preview_x,
+                preview_y,
+                preview_w,
+                preview_h,
+            )?;
+        } else {
+            // Fallback: solid color background
+            let bg_color = if preview.is_current { 0x3a3a3a } else { 0x2a2a2a };
+            self.conn
+                .change_gc(overview.gc, &ChangeGCAux::new().foreground(bg_color))?;
+            self.conn.poly_fill_rectangle(
+                overview.pixmap,
+                overview.gc,
+                &[Rectangle {
+                    x: preview_x,
+                    y: preview_y,
+                    width: preview_w,
+                    height: preview_h,
+                }],
+            )?;
+        }
+
+        // 2. Render mini-window thumbnails
+        for mini in &preview.mini_windows {
+            // Find the capture by frame window ID
+            if let Some(capture) = captures.iter().find(|c| c.info.frame_window == mini.window_id) {
+                self.render_mini_thumbnail(
+                    capture.picture,
+                    overview.picture,
+                    capture.info.width,
+                    capture.info.height,
+                    preview_x + mini.x,
+                    preview_y + mini.y,
+                    mini.width,
+                    mini.height,
+                )?;
+            }
+        }
+
+        // 3. Draw border
+        let border_color = if preview.is_current || is_hovered {
+            0x4488FF
+        } else {
+            0x444444
+        };
+        let border_width: i16 = 2;
+        self.conn.change_gc(
+            overview.gc,
+            &ChangeGCAux::new()
+                .foreground(border_color)
+                .line_width(border_width as u32),
+        )?;
+        self.conn.poly_rectangle(
+            overview.pixmap,
+            overview.gc,
+            &[Rectangle {
+                x: preview_x,
+                y: preview_y,
+                width: preview_w,
+                height: preview_h,
+            }],
+        )?;
+
+        Ok(())
+    }
+
+    /// Render wallpaper scaled to fit within a preview rectangle.
+    fn render_wallpaper_scaled(
+        &self,
+        src_picture: Picture,
+        dst_picture: Picture,
+        dst_x: i16,
+        dst_y: i16,
+        dst_width: u16,
+        dst_height: u16,
+    ) -> Result<()> {
+        // XRender transforms work in reverse: we specify how to map
+        // destination coords back to source coords
+        // scale = src_size / dst_size
+        let scale_x = self.screen_width as f64 / dst_width as f64;
+        let scale_y = self.screen_height as f64 / dst_height as f64;
+
+        let transform = Transform {
+            matrix11: double_to_fixed(scale_x),
+            matrix12: 0,
+            matrix13: 0,
+            matrix21: 0,
+            matrix22: double_to_fixed(scale_y),
+            matrix23: 0,
+            matrix31: 0,
+            matrix32: 0,
+            matrix33: double_to_fixed(1.0),
+        };
+
+        render::set_picture_transform(&self.conn, src_picture, transform)?;
+        render::set_picture_filter(&self.conn, src_picture, b"bilinear", &[])?;
+
+        render::composite(
+            &self.conn,
+            PictOp::SRC,
+            src_picture,
+            x11rb::NONE,
+            dst_picture,
+            0,
+            0, // Source position (transformed)
+            0,
+            0, // Mask position
+            dst_x,
+            dst_y,
+            dst_width,
+            dst_height,
+        )?;
+
+        // Reset transform to identity for other operations
+        let identity = Transform {
+            matrix11: double_to_fixed(1.0),
+            matrix12: 0,
+            matrix13: 0,
+            matrix21: 0,
+            matrix22: double_to_fixed(1.0),
+            matrix23: 0,
+            matrix31: 0,
+            matrix32: 0,
+            matrix33: double_to_fixed(1.0),
+        };
+        render::set_picture_transform(&self.conn, src_picture, identity)?;
+
+        Ok(())
+    }
+
+    /// Render a mini window thumbnail at the specified position.
+    fn render_mini_thumbnail(
+        &self,
+        src_picture: Picture,
+        dst_picture: Picture,
+        src_width: u16,
+        src_height: u16,
+        dst_x: i16,
+        dst_y: i16,
+        dst_width: u16,
+        dst_height: u16,
+    ) -> Result<()> {
+        if dst_width == 0 || dst_height == 0 {
+            return Ok(());
+        }
+
+        let scale_x = src_width as f64 / dst_width as f64;
+        let scale_y = src_height as f64 / dst_height as f64;
+
+        let transform = Transform {
+            matrix11: double_to_fixed(scale_x),
+            matrix12: 0,
+            matrix13: 0,
+            matrix21: 0,
+            matrix22: double_to_fixed(scale_y),
+            matrix23: 0,
+            matrix31: 0,
+            matrix32: 0,
+            matrix33: double_to_fixed(1.0),
+        };
+
+        render::set_picture_transform(&self.conn, src_picture, transform)?;
+        // Use nearest neighbor for tiny thumbnails to avoid excessive blur
+        render::set_picture_filter(&self.conn, src_picture, b"nearest", &[])?;
+
+        render::composite(
+            &self.conn,
+            PictOp::OVER, // OVER to handle window transparency
+            src_picture,
+            x11rb::NONE,
+            dst_picture,
+            0,
+            0,
+            0,
+            0,
+            dst_x,
+            dst_y,
+            dst_width,
+            dst_height,
         )?;
 
         Ok(())

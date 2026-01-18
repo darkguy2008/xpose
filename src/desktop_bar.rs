@@ -1,9 +1,15 @@
 /// Desktop bar UI for virtual desktop management (Mission Control style).
 
+use x11rb::protocol::xproto::Window;
+
+use crate::capture::CapturedWindow;
+use crate::xdeskie::XdeskieState;
+
 // Layout constants
 pub const BAR_HEIGHT: u16 = 120;
 const PREVIEW_PADDING: u16 = 15;
 const PREVIEW_HEIGHT: u16 = 80;
+const PREVIEW_WIDTH: u16 = (PREVIEW_HEIGHT as f64 * 16.0 / 9.0) as u16; // ~142
 const PLUS_BUTTON_SIZE: u16 = 40;
 const PLUS_BUTTON_MARGIN: u16 = 20;
 
@@ -16,6 +22,16 @@ pub enum DesktopBarHit {
     PlusButton,
 }
 
+/// Layout for a mini-window thumbnail within a desktop preview.
+#[derive(Debug, Clone)]
+pub struct MiniWindowLayout {
+    pub window_id: Window,   // X11 window ID for lookup in captures
+    pub x: i16,              // X position within preview (relative to preview origin)
+    pub y: i16,              // Y position within preview (relative to preview origin)
+    pub width: u16,          // Scaled width
+    pub height: u16,         // Scaled height
+}
+
 /// Layout rectangle for a desktop preview in the bar.
 #[derive(Debug, Clone)]
 pub struct DesktopPreviewLayout {
@@ -25,6 +41,7 @@ pub struct DesktopPreviewLayout {
     pub width: u16,
     pub height: u16,
     pub is_current: bool,
+    pub mini_windows: Vec<MiniWindowLayout>,  // Windows to render in this preview
 }
 
 /// Layout for the plus button.
@@ -73,6 +90,7 @@ impl DesktopBar {
                 width: preview_width,
                 height: preview_height,
                 is_current: i == current_desktop,
+                mini_windows: Vec::new(),
             });
         }
 
@@ -125,6 +143,76 @@ impl DesktopBar {
             .iter()
             .find(|p| p.desktop_index == desktop_index)
             .map(|p| (p.x + (p.width / 2) as i16, p.y + (p.height / 2) as i16))
+    }
+
+    /// Calculate mini-window layouts for all desktop previews.
+    /// Takes window captures and xdeskie state to determine which windows
+    /// appear on which desktop, and calculates their scaled positions.
+    pub fn calculate_mini_layouts(
+        &mut self,
+        captures: &[CapturedWindow],
+        xdeskie_state: &XdeskieState,
+        screen_width: u16,
+        screen_height: u16,
+    ) {
+        // Scale factors for screen -> preview mapping
+        let scale_x = PREVIEW_WIDTH as f64 / screen_width as f64;
+        let scale_y = PREVIEW_HEIGHT as f64 / screen_height as f64;
+
+        log::debug!(
+            "Calculating mini layouts: scale_x={:.4}, scale_y={:.4}",
+            scale_x,
+            scale_y
+        );
+
+        for preview in &mut self.preview_layouts {
+            preview.mini_windows.clear();
+
+            // Desktop indices in our UI are 0-based, but xdeskie uses 1-based
+            let xdeskie_desktop = preview.desktop_index + 1;
+
+            // Get window IDs for this desktop (including sticky windows)
+            let window_ids = xdeskie_state.windows_on_desktop(xdeskie_desktop);
+
+            for window_id in window_ids {
+                // Find the capture for this window (try both client and frame)
+                let capture = captures.iter().find(|c| {
+                    c.info.client_window == window_id || c.info.frame_window == window_id
+                });
+
+                if let Some(cap) = capture {
+                    // Scale window position and size to preview coordinates
+                    let mini_x = (cap.info.x as f64 * scale_x) as i16;
+                    let mini_y = (cap.info.y as f64 * scale_y) as i16;
+                    let mini_w = (cap.info.width as f64 * scale_x).max(4.0) as u16;
+                    let mini_h = (cap.info.height as f64 * scale_y).max(3.0) as u16;
+
+                    preview.mini_windows.push(MiniWindowLayout {
+                        window_id: cap.info.frame_window,
+                        x: mini_x,
+                        y: mini_y,
+                        width: mini_w,
+                        height: mini_h,
+                    });
+
+                    log::debug!(
+                        "Desktop {}: window {:?} at ({}, {}) {}x{}",
+                        preview.desktop_index,
+                        cap.info.wm_name,
+                        mini_x,
+                        mini_y,
+                        mini_w,
+                        mini_h
+                    );
+                }
+            }
+
+            log::debug!(
+                "Desktop {} has {} mini windows",
+                preview.desktop_index,
+                preview.mini_windows.len()
+            );
+        }
     }
 }
 
