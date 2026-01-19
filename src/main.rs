@@ -353,7 +353,7 @@ use animation::{AnimatedLayout, AnimationConfig, Animator};
 use capture::CapturedWindow;
 use config::Config;
 use connection::XConnection;
-use desktop_bar::{DesktopBar, BAR_HEIGHT};
+use desktop_bar::DesktopBar;
 use error::Result;
 use input::{InputAction, InputHandler};
 use layout::{calculate_layout, LayoutConfig, ThumbnailLayout};
@@ -418,12 +418,13 @@ fn run() -> Result<()> {
     );
 
     // Initialize desktop bar
+    let bar_height = config.desktop_bar_height;
     let mut desktop_bar = Some(DesktopBar::new(
         desktop_state.desktops,
         desktop_state.current,
         xconn.screen_width,
+        bar_height,
     ));
-    let bar_height = BAR_HEIGHT;
 
     // Find ALL windows including unmapped ones (for virtual desktop support)
     // original_stacking_order contains frame window IDs in their X11 stacking order (bottom-to-top)
@@ -915,6 +916,7 @@ fn run() -> Result<()> {
                         desktop_state.desktops,
                         desktop_state.current,
                         xconn.screen_width,
+                        bar_height,
                     ));
 
                     // Create animation: existing desktops slide to new positions, new one appears
@@ -999,6 +1001,7 @@ fn run() -> Result<()> {
                                 desktop_state.desktops,
                                 desktop_state.current,
                                 xconn.screen_width,
+                                bar_height,
                             ));
 
                             // Start slide animation for remaining desktops
@@ -1164,7 +1167,8 @@ fn run() -> Result<()> {
                         .unwrap_or_default();
 
                     // Store dragged desktop's current position (at cursor)
-                    let dragged_x = desktop_drag_cursor_x - (crate::desktop_bar::PREVIEW_WIDTH / 2) as i16;
+                    let preview_width = desktop_bar.as_ref().map(|b| b.preview_width).unwrap_or(160);
+                    let dragged_x = desktop_drag_cursor_x - (preview_width / 2) as i16;
 
                     if let Err(e) = desktop::reorder_desktop(&xconn, &mut desktop_state, from_desktop, to_position) {
                         log::warn!("Failed to reorder desktop: {}", e);
@@ -1174,6 +1178,7 @@ fn run() -> Result<()> {
                             desktop_state.desktops,
                             desktop_state.current,
                             xconn.screen_width,
+                            bar_height,
                         ));
 
                         // Create animation from drag positions to final positions
@@ -2017,8 +2022,6 @@ fn render_desktop_bar_with_drag(
     captures: &[CapturedWindow],
     animated_positions: Option<Vec<(u32, i16)>>,
 ) -> Result<()> {
-    use crate::desktop_bar::PREVIEW_WIDTH;
-
     // Render bar background
     xconn.render_desktop_bar_background(overview, desktop_bar.bar_height, 0)?;
 
@@ -2075,7 +2078,7 @@ fn render_desktop_bar_with_drag(
         .find(|p| p.desktop_index == dragged_desktop)
     {
         // Center the preview on cursor X
-        let drag_x = cursor_x - (PREVIEW_WIDTH / 2) as i16;
+        let drag_x = cursor_x - (desktop_bar.preview_width / 2) as i16;
         let drag_y = preview.y;
 
         // Render with slight visual difference (could add shadow later)

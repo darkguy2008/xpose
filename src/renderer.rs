@@ -931,8 +931,8 @@ impl XConnection {
         };
 
         render::set_picture_transform(&self.conn, src_picture, transform)?;
-        // Use nearest neighbor for tiny thumbnails to avoid excessive blur
-        render::set_picture_filter(&self.conn, src_picture, b"nearest", &[])?;
+        // Use bilinear filtering for smooth scaling
+        render::set_picture_filter(&self.conn, src_picture, b"bilinear", &[])?;
 
         render::composite(
             &self.conn,

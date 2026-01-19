@@ -8,6 +8,8 @@ pub struct Config {
     pub animation_speed: f64,
     /// WM_CLASS values to exclude from the exposé view
     pub exclude_classes: Vec<String>,
+    /// Height of the virtual desktop bar in pixels
+    pub desktop_bar_height: u16,
 }
 
 impl Default for Config {
@@ -17,6 +19,7 @@ impl Default for Config {
             exit_ms: 350,
             animation_speed: 1.0,
             exclude_classes: Vec::new(),
+            desktop_bar_height: 240,
         }
     }
 }
@@ -80,6 +83,14 @@ impl Config {
                 "ExcludeClass" => {
                     config.exclude_classes.push(value.to_string());
                     log::debug!("Config: ExcludeClass = {}", value);
+                }
+                "DesktopBarHeight" => {
+                    if let Ok(height) = value.parse::<u16>() {
+                        if height > 0 {
+                            config.desktop_bar_height = height;
+                            log::debug!("Config: DesktopBarHeight = {}", height);
+                        }
+                    }
                 }
                 _ => {
                     log::debug!("Config: unknown key '{}'", key);

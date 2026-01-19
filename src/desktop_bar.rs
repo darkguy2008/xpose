@@ -6,10 +6,7 @@ use crate::capture::CapturedWindow;
 use crate::desktop::DesktopState;
 
 // Layout constants
-pub const BAR_HEIGHT: u16 = 120;
 pub const PREVIEW_PADDING: u16 = 15;
-pub const PREVIEW_HEIGHT: u16 = 80;
-pub const PREVIEW_WIDTH: u16 = (PREVIEW_HEIGHT as f64 * 16.0 / 9.0) as u16; // ~142
 const PLUS_BUTTON_SIZE: u16 = 40;
 const PLUS_BUTTON_MARGIN: u16 = 20;
 const DELETE_BUTTON_SIZE: u16 = 16;
@@ -69,15 +66,15 @@ pub struct DesktopBar {
     pub preview_layouts: Vec<DesktopPreviewLayout>,
     pub plus_button: PlusButtonLayout,
     pub bar_height: u16,
+    pub preview_width: u16,
+    pub preview_height: u16,
 }
 
 impl DesktopBar {
     /// Create desktop bar from xdeskie properties.
-    pub fn new(num_desktops: u32, current_desktop: u32, screen_width: u16) -> Self {
-        let bar_height = BAR_HEIGHT;
-
-        // Calculate preview dimensions (16:9 aspect ratio)
-        let preview_height = PREVIEW_HEIGHT;
+    pub fn new(num_desktops: u32, current_desktop: u32, screen_width: u16, bar_height: u16) -> Self {
+        // Calculate preview height proportionally (2/3 of bar height)
+        let preview_height = (bar_height as f64 * 2.0 / 3.0) as u16;
         let preview_width = (preview_height as f64 * 16.0 / 9.0) as u16;
 
         // Calculate total width of all previews + padding
@@ -120,6 +117,8 @@ impl DesktopBar {
             preview_layouts,
             plus_button,
             bar_height,
+            preview_width,
+            preview_height,
         }
     }
 
@@ -193,7 +192,7 @@ impl DesktopBar {
         dragged_index: u32,
         insert_before: u32,
     ) -> Vec<(u32, i16)> {
-        let gap_width = (PREVIEW_WIDTH + PREVIEW_PADDING) as i16;
+        let gap_width = (self.preview_width + PREVIEW_PADDING) as i16;
         let mut result = Vec::new();
 
         // Find the starting X of the first preview
@@ -231,7 +230,7 @@ impl DesktopBar {
             }
 
             result.push((preview.desktop_index, x));
-            x += (PREVIEW_WIDTH + PREVIEW_PADDING) as i16;
+            x += (self.preview_width + PREVIEW_PADDING) as i16;
 
             // Add gap at the end if inserting at the end
             if insert_before >= self.num_desktops
@@ -256,8 +255,8 @@ impl DesktopBar {
         screen_height: u16,
     ) {
         // Scale factors for screen -> preview mapping
-        let scale_x = PREVIEW_WIDTH as f64 / screen_width as f64;
-        let scale_y = PREVIEW_HEIGHT as f64 / screen_height as f64;
+        let scale_x = self.preview_width as f64 / screen_width as f64;
+        let scale_y = self.preview_height as f64 / screen_height as f64;
 
         log::debug!(
             "Calculating mini layouts: scale_x={:.4}, scale_y={:.4}",
@@ -331,7 +330,7 @@ mod tests {
 
     #[test]
     fn test_desktop_bar_layout() {
-        let bar = DesktopBar::new(4, 0, 1920);
+        let bar = DesktopBar::new(4, 0, 1920, 240);
 
         assert_eq!(bar.num_desktops, 4);
         assert_eq!(bar.current_desktop, 0);
@@ -342,7 +341,7 @@ mod tests {
 
     #[test]
     fn test_hit_test_desktop() {
-        let bar = DesktopBar::new(4, 0, 1920);
+        let bar = DesktopBar::new(4, 0, 1920, 240);
         let preview = &bar.preview_layouts[0];
 
         // Hit inside first preview
@@ -352,7 +351,7 @@ mod tests {
 
     #[test]
     fn test_hit_test_plus_button() {
-        let bar = DesktopBar::new(4, 0, 1920);
+        let bar = DesktopBar::new(4, 0, 1920, 240);
         let pb = &bar.plus_button;
 
         let hit = bar.hit_test(pb.x + 5, pb.y + 5);
@@ -361,7 +360,7 @@ mod tests {
 
     #[test]
     fn test_hit_test_none() {
-        let bar = DesktopBar::new(4, 0, 1920);
+        let bar = DesktopBar::new(4, 0, 1920, 240);
 
         // Hit in empty area
         let hit = bar.hit_test(5, 5);
@@ -370,16 +369,17 @@ mod tests {
 
     #[test]
     fn test_contains_point() {
-        let bar = DesktopBar::new(4, 0, 1920);
+        let bar = DesktopBar::new(4, 0, 1920, 240);
 
         assert!(bar.contains_point(100, 50));
-        assert!(!bar.contains_point(100, 150));
+        assert!(bar.contains_point(100, 200)); // 200 is inside bar_height=240
+        assert!(!bar.contains_point(100, 250)); // 250 is outside
         assert!(!bar.contains_point(100, -10));
     }
 
     #[test]
     fn test_get_preview_center() {
-        let bar = DesktopBar::new(4, 0, 1920);
+        let bar = DesktopBar::new(4, 0, 1920, 240);
 
         // First desktop should have a center
         let center = bar.get_preview_center(0);
